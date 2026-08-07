@@ -22,11 +22,16 @@ Two compressed .npz files per run, split by physiological state:
 sub-001_task-Rest_run-01_eeg_EO.npz
 sub-001_task-Rest_run-01_eeg_EC.npz
 
-Saved data shape:
-(N, C, T)
+Saved arrays in each EO / EC NPZ:
+data : (N, C, T)
+fc   : (N, C, C)
+
 N = number of event-aware non-overlapping 1-s windows
 C = 64 EEG channels
 T = 250 samples after resampling to 250 Hz
+
+fc[i] is the Pearson functional-connectivity matrix computed from data[i].
+The FC diagonal is set to 0. Undefined correlations are safely replaced by 0.
 
 Only complete windows fully contained within one Eyes Open / Eyes Closed
 event block are saved; unlabelled gaps and boundary remainders are discarded.
@@ -45,14 +50,15 @@ import numpy as np
 import pandas as pd
 from mne.preprocessing import ICA
 from sklearn.exceptions import ConvergenceWarning
+from tqdm import tqdm
 
 
 # =============================================================================
 # 1. USER CONFIGURATION
 # =============================================================================
 
-DATASET_ROOT = Path(r"E:\Downloads\ds003478")
-OUTPUT_DIR = Path(r"E:\Downloads\ds003478_processed")
+DATASET_ROOT = Path(r"E:/Downloads/ds003478")
+OUTPUT_DIR = Path(r"E:/Workspace/dataset/PREDCT_processed")
 
 DATASET_NAME = "PRED+CT"
 
@@ -91,6 +97,10 @@ OVERWRITE = False
 # are created. Windows are never allowed to cross an event-block boundary.
 REQUIRE_EVENTS_TSV = True
 EVENT_STATE_PREFIXES = ("Eyes Open", "Eyes Closed")
+# The 500-ms trigger stream should keep consecutive markers close together.
+# A larger gap means a new physiological-state block, even if the same
+# canonical trigger code is reused later in the recording.
+EVENT_BLOCK_MAX_GAP_SEC = 3.0
 
 
 # =============================================================================
@@ -167,20 +177,22 @@ def sidecar_paths(set_path: Path) -> dict[str, Path]:
 
 def load_event_blocks(events_path: Path, recording_end_sec: float) -> pd.DataFrame:
     """
-    Convert the PRED+CT repeated trigger markers into non-overlapping
+    Convert repeated PRED+CT EO/EC trigger markers into non-overlapping
     physiological-state blocks.
 
-    The provided events.tsv contains repeated markers such as:
-      Eyes Open: Every 500 ms    + Eyes Open: Every 2000 ms
-      Eyes Closed: Every 500 ms  + Eyes Closed: Every 2000 ms
+    Important
+    ---------
+    The same canonical trigger code may be reused later in a recording.
+    Therefore events MUST NOT be grouped globally only by (state, code).
+    Instead, markers are sorted by onset and split into contiguous runs.
 
-    These marker streams describe the same Eyes Open / Eyes Closed block, not
-    separate EEG states. Trigger values >= 10 are paired with their low-code
-    counterpart (e.g. 12 -> 2, 11 -> 1), which yields block codes 1..6 in the
-    supplied PRED+CT recordings.
+    A new block starts when:
+      1) the physiological state changes (EO <-> EC), or
+      2) the canonical trigger code changes, or
+      3) the gap from the previous marker exceeds EVENT_BLOCK_MAX_GAP_SEC.
 
-    Block end is inferred from the last periodic marker plus its stated marker
-    interval. Unlabelled gaps between blocks are excluded from windowing.
+    This prevents two temporally separate blocks with the same code from being
+    incorrectly merged into one long block that overlaps intervening blocks.
     """
     if not events_path.exists():
         if REQUIRE_EVENTS_TSV:
@@ -200,9 +212,11 @@ def load_event_blocks(events_path: Path, recording_end_sec: float) -> pd.DataFra
     events["onset"] = pd.to_numeric(events["onset"], errors="coerce")
     events["numeric_value"] = pd.to_numeric(events["value"], errors="coerce")
 
-    # Keep only the physiological Rest-state markers used for segmentation.
+    # BIDS events.tsv onset is already in seconds; do NOT divide by sfreq.
     state_pattern = r"^(Eyes Open|Eyes Closed)"
-    events["event_label"] = events["trial_type"].astype(str).str.extract(state_pattern)[0]
+    events["event_label"] = (
+        events["trial_type"].astype(str).str.extract(state_pattern)[0]
+    )
     events = events[
         events["event_label"].isin(EVENT_STATE_PREFIXES)
         & events["onset"].notna()
@@ -210,63 +224,132 @@ def load_event_blocks(events_path: Path, recording_end_sec: float) -> pd.DataFra
     ].copy()
 
     if events.empty:
-        raise ValueError(f"No Eyes Open / Eyes Closed events found in {events_path.name}")
+        raise ValueError(
+            f"No Eyes Open / Eyes Closed events found in {events_path.name}"
+        )
 
-    # PRED+CT uses paired trigger streams: 1/11, 2/12, ..., 6/16.
+    # Pair high-code and low-code trigger streams: 11->1, ..., 16->6.
     def canonical_code(value: float) -> int:
         code = int(round(value))
         return code - 10 if 11 <= code <= 16 else code
 
     events["event_code"] = events["numeric_value"].map(canonical_code)
 
-    # Infer each marker's support interval from text such as "Every 500 ms".
+    # Infer how long each periodic marker supports from its description.
     cadence_ms = pd.to_numeric(
-        events["trial_type"].astype(str).str.extract(r"Every\s+(\d+)\s*ms")[0],
+        events["trial_type"].astype(str).str.extract(
+            r"Every\s+(\d+)\s*ms"
+        )[0],
         errors="coerce",
     )
     events["marker_interval_sec"] = cadence_ms / 1000.0
-    events["marker_interval_sec"] = events["marker_interval_sec"].fillna(WINDOW_SECONDS)
-    events["marker_end"] = events["onset"] + events["marker_interval_sec"]
+    events["marker_interval_sec"] = (
+        events["marker_interval_sec"].fillna(WINDOW_SECONDS)
+    )
+    events["marker_end"] = (
+        events["onset"] + events["marker_interval_sec"]
+    )
+
+    # Sort chronologically before constructing contiguous runs.
+    events = events.sort_values(
+        ["onset", "event_label", "event_code"]
+    ).reset_index(drop=True)
+
+    # Assign a contiguous block number.
+    block_numbers = []
+    current_block = 0
+    prev_label = None
+    prev_code = None
+    prev_onset = None
+
+    for _, row in events.iterrows():
+        label = str(row["event_label"])
+        code = int(row["event_code"])
+        onset = float(row["onset"])
+
+        new_block = (
+            prev_label is None
+            or label != prev_label
+            or code != prev_code
+            or (onset - prev_onset) > EVENT_BLOCK_MAX_GAP_SEC
+        )
+
+        if new_block:
+            current_block += 1
+
+        block_numbers.append(current_block)
+        prev_label = label
+        prev_code = code
+        prev_onset = onset
+
+    events["contiguous_block"] = block_numbers
 
     blocks = []
-    for (event_label, event_code), group in events.groupby(
-        ["event_label", "event_code"], sort=False
-    ):
+    state_running_index = {"EO": 0, "EC": 0}
+
+    for _, group in events.groupby("contiguous_block", sort=True):
+        event_label = str(group["event_label"].iloc[0])
+        event_code = int(group["event_code"].iloc[0])
+        state_short = "EO" if event_label == "Eyes Open" else "EC"
+
         start_sec = float(group["onset"].min())
         end_sec = float(group["marker_end"].max())
         end_sec = min(end_sec, float(recording_end_sec))
+
         if end_sec <= start_sec:
             continue
 
-        block_index = int((int(event_code) + 1) // 2)
-        state_short = "EO" if event_label == "Eyes Open" else "EC"
-        trigger_values = sorted({int(round(v)) for v in group["numeric_value"]})
+        state_running_index[state_short] += 1
+        block_index = state_running_index[state_short]
+
+        trigger_values = sorted(
+            {int(round(v)) for v in group["numeric_value"]}
+        )
 
         blocks.append(
             {
-                "event_label": str(event_label),
-                "event_code": int(event_code),
-                "event_block_id": f"{state_short}_block_{block_index:02d}",
-                "event_trigger_values": "|".join(map(str, trigger_values)),
+                "event_label": event_label,
+                "event_code": event_code,
+                "event_block_id": (
+                    f"{state_short}_block_{block_index:02d}"
+                ),
+                "event_trigger_values": "|".join(
+                    map(str, trigger_values)
+                ),
                 "start_sec": start_sec,
                 "end_sec": end_sec,
             }
         )
 
-    blocks = pd.DataFrame(blocks).sort_values("start_sec").reset_index(drop=True)
+    blocks = pd.DataFrame(blocks)
     if blocks.empty:
-        raise ValueError(f"No valid event blocks could be constructed from {events_path.name}")
+        raise ValueError(
+            f"No valid event blocks could be constructed from "
+            f"{events_path.name}"
+        )
 
-    # Safety check: event blocks used for windowing must not overlap.
+    blocks = blocks.sort_values("start_sec").reset_index(drop=True)
+
+    # Safety check. With contiguous construction this should normally never fire.
+    tolerance = 1e-6
     for i in range(len(blocks) - 1):
-        if blocks.loc[i, "end_sec"] > blocks.loc[i + 1, "start_sec"]:
+        current_end = float(blocks.loc[i, "end_sec"])
+        next_start = float(blocks.loc[i + 1, "start_sec"])
+
+        if current_end > next_start + tolerance:
             raise ValueError(
-                "Constructed event blocks overlap: "
-                f"{blocks.loc[i, 'event_block_id']} and "
-                f"{blocks.loc[i + 1, 'event_block_id']}"
+                "Constructed event blocks still overlap after contiguous "
+                "segmentation: "
+                f"{blocks.loc[i, 'event_block_id']} "
+                f"[{blocks.loc[i, 'start_sec']:.3f}, {current_end:.3f}) and "
+                f"{blocks.loc[i + 1, 'event_block_id']} "
+                f"[{next_start:.3f}, "
+                f"{blocks.loc[i + 1, 'end_sec']:.3f}). "
+                "Please inspect this recording's events.tsv."
             )
 
     return blocks
+
 
 def get_line_frequency(eeg_json_path: Path) -> float:
     """Read power-line frequency from BIDS sidecar, defaulting to 60 Hz."""
@@ -598,9 +681,86 @@ def make_event_aware_one_second_windows(
         np.asarray(block_ends, dtype=np.float64),
     )
 
+
+def compute_pearson_fc(windows: np.ndarray) -> np.ndarray:
+    """
+    Compute one Pearson functional-connectivity matrix per EEG window.
+
+    Parameters
+    ----------
+    windows
+        EEG windows with shape (N, C, T).
+
+    Returns
+    -------
+    fc
+        Pearson correlation matrices with shape (N, C, C), dtype float32.
+
+    Notes
+    -----
+    - Each FC matrix corresponds exactly to the EEG window at the same index.
+    - Correlation coefficients are in [-1, 1].
+    - The diagonal is explicitly set to 0 because self-connections are not
+      used as graph edges in T2S-SSL.
+    - If a channel has zero variance in a window, undefined correlations are
+      replaced by 0 rather than NaN/Inf.
+    """
+    if windows.ndim != 3:
+        raise ValueError(
+            f"Expected windows with shape (N, C, T), got {windows.shape}"
+        )
+
+    # Work in float32 to keep memory usage practical for large batches.
+    x = np.asarray(windows, dtype=np.float32)
+
+    # Pearson correlation requires channel-wise demeaning. Baseline correction
+    # already makes the mean close to zero, but this keeps FC computation
+    # mathematically correct even if APPLY_BASELINE is later disabled.
+    x = x - x.mean(axis=2, keepdims=True)
+
+    # Numerator: pairwise dot products for every window.
+    numerator = np.einsum(
+        "nct,ndt->ncd",
+        x,
+        x,
+        optimize=True,
+        dtype=np.float32,
+    )
+
+    # Denominator: product of channel L2 norms.
+    norms = np.sqrt(
+        np.sum(x * x, axis=2, dtype=np.float32)
+    )
+    denominator = norms[:, :, None] * norms[:, None, :]
+
+    fc = np.zeros_like(numerator, dtype=np.float32)
+    np.divide(
+        numerator,
+        denominator,
+        out=fc,
+        where=denominator > np.finfo(np.float32).eps,
+    )
+
+    # Numerical safety.
+    fc = np.nan_to_num(
+        fc,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    np.clip(fc, -1.0, 1.0, out=fc)
+
+    # Remove self-connections.
+    diag = np.arange(fc.shape[1])
+    fc[:, diag, diag] = 0.0
+
+    return fc
+
+
 def save_npz(
     output_path: Path,
     data: np.ndarray,
+    fc: np.ndarray,
     starts: np.ndarray,
     ends: np.ndarray,
     labels: np.ndarray,
@@ -632,7 +792,11 @@ def save_npz(
         "subject_id": subject_id,
         "run_id": run_id,
         "shape": list(data.shape),
+        "fc_shape": list(fc.shape),
         "data_unit": "V",
+        "functional_connectivity": "Pearson correlation computed independently for each 1-s EEG window",
+        "fc_range": [-1.0, 1.0],
+        "fc_diagonal": 0.0,
         "target_sfreq": TARGET_SFREQ,
         "window_seconds": WINDOW_SECONDS,
         "windowing": "event-aware; windows never cross event-block boundaries",
@@ -658,9 +822,15 @@ def save_npz(
         "baseline_correction": "whole-window mean" if APPLY_BASELINE else "none",
     }
 
+    if fc.shape != (data.shape[0], data.shape[1], data.shape[1]):
+        raise ValueError(
+            f"FC shape {fc.shape} does not match EEG data shape {data.shape}."
+        )
+
     np.savez_compressed(
         output_path,
         data=data,
+        fc=fc,
         labels=labels,
         event_codes=event_codes,
         event_block_ids=event_block_ids,
@@ -678,6 +848,20 @@ def save_npz(
         source_file=np.asarray(source_file, dtype=np.str_),
         metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False), dtype=np.str_),
     )
+
+
+def count_existing_npz_windows(path: Path) -> int:
+    """Return N from an existing saved NPZ without loading all EEG arrays."""
+    if not path.exists():
+        return 0
+    try:
+        with np.load(path, allow_pickle=False) as npz:
+            if "data" in npz:
+                return int(npz["data"].shape[0])
+    except Exception:
+        pass
+    return 0
+
 
 
 # =============================================================================
@@ -705,6 +889,8 @@ def process_one_recording(
     output_path_ec = output_dir / f"{set_path.stem}_EC.npz"
 
     if output_path_eo.exists() and output_path_ec.exists() and not OVERWRITE:
+        eo_count = count_existing_npz_windows(output_path_eo)
+        ec_count = count_existing_npz_windows(output_path_ec)
         return {
             "subject_id": subject_id,
             "run_id": run_id,
@@ -712,6 +898,12 @@ def process_one_recording(
             "output_file_eo": output_path_eo.name,
             "output_file_ec": output_path_ec.name,
             "status": "SKIPPED_EXISTS",
+            "eyes_open_windows": eo_count,
+            "eyes_closed_windows": ec_count,
+            "n_windows_total": eo_count + ec_count,
+            "n_channels": len(COMMON_64),
+            "samples_per_window": int(round(WINDOW_SECONDS * TARGET_SFREQ)),
+            "fc_shape_per_window": "64x64",
         }
 
     # Read SET; MNE automatically loads its paired external FDT.
@@ -809,9 +1001,13 @@ def process_one_recording(
         if state_output_path.exists() and not OVERWRITE:
             continue
 
+        state_data = data[mask]
+        state_fc = compute_pearson_fc(state_data)
+
         save_npz(
             output_path=state_output_path,
-            data=data[mask],
+            data=state_data,
+            fc=state_fc,
             starts=starts[mask],
             ends=ends[mask],
             labels=labels[mask],
@@ -842,6 +1038,8 @@ def process_one_recording(
         "n_windows_total": int(data.shape[0]),
         "n_channels": int(data.shape[1]),
         "samples_per_window": int(data.shape[2]),
+        "fc_shape_per_window": f"{data.shape[1]}x{data.shape[1]}",
+        "fc_method": "Pearson correlation; diagonal=0",
         "line_freq": line_freq,
         "eyes_open_windows": state_counts.get("EO", 0),
         "eyes_closed_windows": state_counts.get("EC", 0),
@@ -902,9 +1100,32 @@ def main() -> None:
         raise RuntimeError("No PRED+CT recordings were found.")
 
     results = []
+    success_count = 0
+    skip_count = 0
+    error_count = 0
 
-    for index, set_path in enumerate(recordings, start=1):
-        print(f"\n[{index}/{len(recordings)}] {set_path}")
+    # tqdm automatically displays:
+    # percentage, processed/total recordings, elapsed time, speed and ETA.
+    progress_bar = tqdm(
+        recordings,
+        total=len(recordings),
+        desc="PRED+CT preprocessing",
+        unit="recording",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+    for set_path in progress_bar:
+        subject_id, run_id = parse_subject_and_run(set_path)
+
+        progress_bar.set_postfix(
+            subject=subject_id,
+            run=run_id,
+            OK=success_count,
+            SKIP=skip_count,
+            ERR=error_count,
+            refresh=True,
+        )
 
         try:
             result = process_one_recording(
@@ -912,16 +1133,29 @@ def main() -> None:
                 output_dir=OUTPUT_DIR,
             )
             results.append(result)
-            print(
-                f"  -> {result['status']}: "
-                f"EO={result.get('output_file_eo', '')} "
-                f"({result.get('eyes_open_windows', '')} windows), "
-                f"EC={result.get('output_file_ec', '')} "
-                f"({result.get('eyes_closed_windows', '')} windows)"
-            )
+
+            if result.get("status") == "SKIPPED_EXISTS":
+                skip_count += 1
+                tqdm.write(
+                    f"[SKIP] {subject_id} {run_id} | existing files | "
+                    f"EO={result.get('eyes_open_windows', 0)} windows | "
+                    f"EC={result.get('eyes_closed_windows', 0)} windows | "
+                    f"FC=64x64"
+                )
+            else:
+                success_count += 1
+                tqdm.write(
+                    f"[OK] {subject_id} {run_id} | "
+                    f"EO={result.get('eyes_open_windows', 0)} windows | "
+                    f"EC={result.get('eyes_closed_windows', 0)} windows | "
+                    f"FC=64x64"
+                )
+
         except Exception as error:
-            subject_id, run_id = parse_subject_and_run(set_path)
-            print(f"  -> ERROR: {error}")
+            error_count += 1
+            tqdm.write(
+                f"[ERROR] {subject_id} {run_id} | {error}"
+            )
             results.append(
                 {
                     "subject_id": subject_id,
@@ -932,17 +1166,37 @@ def main() -> None:
                 }
             )
 
-        # Write a continuously updated log so a long batch can be resumed/audited.
+        # Update the visible success/error counters after each recording.
+        progress_bar.set_postfix(
+            subject=subject_id,
+            run=run_id,
+            OK=success_count,
+            SKIP=skip_count,
+            ERR=error_count,
+            refresh=True,
+        )
+
+        # Continuously save the log, so long jobs can be audited/resumed.
         pd.DataFrame(results).to_csv(
             OUTPUT_DIR / "PREDCT_preprocessing_summary.csv",
             index=False,
             encoding="utf-8-sig",
         )
 
+    progress_bar.close()
+
     summary = pd.DataFrame(results)
+
     print("\nBatch finished.")
+    print(f"Successful : {success_count}")
+    print(f"Skipped    : {skip_count}")
+    print(f"Failed     : {error_count}")
+    print(f"Total      : {len(recordings)}")
     print(summary["status"].value_counts(dropna=False))
-    print(f"Summary saved to: {OUTPUT_DIR / 'PREDCT_preprocessing_summary.csv'}")
+    print(
+        f"Summary saved to: "
+        f"{OUTPUT_DIR / 'PREDCT_preprocessing_summary.csv'}"
+    )
 
 
 if __name__ == "__main__":
