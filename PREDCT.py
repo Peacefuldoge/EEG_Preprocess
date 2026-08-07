@@ -58,7 +58,7 @@ from tqdm import tqdm
 # =============================================================================
 
 DATASET_ROOT = Path(r"E:/Downloads/ds003478")
-OUTPUT_DIR = Path(r"E:/Workspace/dataset/PREDCT_processed")
+OUTPUT_DIR = Path(r"E:/Workspace/dataset/preprocessed/PRED_CT")
 
 DATASET_NAME = "PRED+CT"
 
@@ -101,6 +101,24 @@ EVENT_STATE_PREFIXES = ("Eyes Open", "Eyes Closed")
 # A larger gap means a new physiological-state block, even if the same
 # canonical trigger code is reused later in the recording.
 EVENT_BLOCK_MAX_GAP_SEC = 3.0
+# Event blocks shorter than one analysis window cannot contribute any saved data
+# and are treated as stray/boundary markers.
+MIN_EVENT_BLOCK_SEC = WINDOW_SECONDS
+# Small overlaps are usually caused by the inferred support interval of the
+# final periodic trigger. Trim the earlier block at the next block onset.
+# Larger overlaps remain errors because they may indicate incorrect grouping.
+MAX_AUTO_TRIM_OVERLAP_SEC = WINDOW_SECONDS
+
+# Fallback for recordings whose events.tsv contains only STATUS trigger rows.
+# Trigger pairs 1/11 ... 6/16 are treated as candidate state blocks; values
+# outside those ranges (e.g. 17 boundary markers) are ignored. The final EO/EC
+# direction is inferred from posterior alpha power after EEG preprocessing.
+ALLOW_STATUS_ALPHA_FALLBACK = True
+STATUS_VALID_LOW_CODES = tuple(range(1, 7))
+POSTERIOR_ALPHA_CHANNELS = ["O1", "Oz", "O2", "PO3", "POz", "PO4", "PO7", "PO8"]
+ALPHA_BAND_HZ = (8.0, 13.0)
+ALPHA_REFERENCE_BAND_HZ = (1.0, 30.0)
+ALPHA_INFERENCE_MIN_RATIO = 1.10
 
 
 # =============================================================================
@@ -175,24 +193,218 @@ def sidecar_paths(set_path: Path) -> dict[str, Path]:
     }
 
 
-def load_event_blocks(events_path: Path, recording_end_sec: float) -> pd.DataFrame:
+def _canonical_predct_code(value: float) -> int:
+    """Map paired PRED+CT triggers 11..16 onto 1..6."""
+    code = int(round(value))
+    return code - 10 if 11 <= code <= 16 else code
+
+
+def _infer_marker_intervals(events: pd.DataFrame) -> pd.Series:
     """
-    Convert repeated PRED+CT EO/EC trigger markers into non-overlapping
-    physiological-state blocks.
+    Return the support interval (seconds) for each repeated marker.
 
-    Important
-    ---------
-    The same canonical trigger code may be reused later in a recording.
-    Therefore events MUST NOT be grouped globally only by (state, code).
-    Instead, markers are sorted by onset and split into contiguous runs.
+    Prefer explicit text such as ``Every 500 ms``. STATUS-only files do not
+    contain that text, so their cadence is estimated separately for each raw
+    trigger value from the median positive inter-marker interval.
+    """
+    cadence_ms = pd.to_numeric(
+        events["trial_type"].astype(str).str.extract(r"Every\s+(\d+)\s*ms")[0],
+        errors="coerce",
+    )
+    intervals = cadence_ms / 1000.0
 
-    A new block starts when:
-      1) the physiological state changes (EO <-> EC), or
-      2) the canonical trigger code changes, or
-      3) the gap from the previous marker exceeds EVENT_BLOCK_MAX_GAP_SEC.
+    for value, idx in events.groupby("numeric_value").groups.items():
+        missing_idx = [i for i in idx if not np.isfinite(intervals.loc[i])]
+        if not missing_idx:
+            continue
 
-    This prevents two temporally separate blocks with the same code from being
-    incorrectly merged into one long block that overlaps intervening blocks.
+        onsets = np.sort(events.loc[list(idx), "onset"].dropna().to_numpy(float))
+        diffs = np.diff(onsets)
+        diffs = diffs[(diffs > 0.05) & (diffs <= EVENT_BLOCK_MAX_GAP_SEC)]
+        if diffs.size:
+            estimated = float(np.median(diffs))
+        else:
+            estimated = float(WINDOW_SECONDS)
+
+        # Keep support intervals conservative and bounded.
+        estimated = float(np.clip(estimated, 0.1, EVENT_BLOCK_MAX_GAP_SEC))
+        intervals.loc[missing_idx] = estimated
+
+    return intervals.fillna(WINDOW_SECONDS).astype(float)
+
+
+def _construct_contiguous_blocks(
+    events: pd.DataFrame,
+    recording_end_sec: float,
+    labelled: bool,
+) -> pd.DataFrame:
+    """Build time-contiguous blocks from already-filtered marker rows."""
+    events = events.copy()
+    events["event_code"] = events["numeric_value"].map(_canonical_predct_code)
+    events["marker_interval_sec"] = _infer_marker_intervals(events)
+    events["marker_end"] = events["onset"] + events["marker_interval_sec"]
+    events = events.sort_values(["onset", "event_code"]).reset_index(drop=True)
+
+    block_numbers = []
+    current_block = 0
+    prev_label = None
+    prev_code = None
+    prev_onset = None
+
+    for _, row in events.iterrows():
+        label = str(row["event_label"]) if labelled else "STATUS"
+        code = int(row["event_code"])
+        onset = float(row["onset"])
+        new_block = (
+            prev_code is None
+            or code != prev_code
+            or (labelled and label != prev_label)
+            or (onset - prev_onset) > EVENT_BLOCK_MAX_GAP_SEC
+        )
+        if new_block:
+            current_block += 1
+        block_numbers.append(current_block)
+        prev_label = label
+        prev_code = code
+        prev_onset = onset
+
+    events["contiguous_block"] = block_numbers
+    blocks = []
+    state_running_index = {"EO": 0, "EC": 0, "STATUS": 0}
+
+    for _, group in events.groupby("contiguous_block", sort=True):
+        event_code = int(group["event_code"].iloc[0])
+        event_label = str(group["event_label"].iloc[0]) if labelled else "Unknown"
+        state_short = (
+            "EO" if event_label == "Eyes Open"
+            else "EC" if event_label == "Eyes Closed"
+            else "STATUS"
+        )
+        start_sec = float(group["onset"].min())
+        end_sec = min(float(group["marker_end"].max()), float(recording_end_sec))
+        if end_sec <= start_sec:
+            continue
+
+        state_running_index[state_short] += 1
+        block_index = state_running_index[state_short]
+        trigger_values = sorted({int(round(v)) for v in group["numeric_value"]})
+        blocks.append({
+            "event_label": event_label,
+            "event_code": event_code,
+            "event_block_id": f"{state_short}_block_{block_index:02d}",
+            "event_trigger_values": "|".join(map(str, trigger_values)),
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "event_label_method": "events_tsv" if labelled else "status_trigger_candidate",
+        })
+
+    blocks = pd.DataFrame(blocks)
+    if blocks.empty:
+        raise ValueError("No valid event blocks could be constructed.")
+    return blocks.sort_values("start_sec").reset_index(drop=True)
+
+
+def _posterior_relative_alpha(raw: mne.io.BaseRaw, start_sec: float, end_sec: float) -> float:
+    """Compute posterior relative alpha power for one candidate state block."""
+    channels = [ch for ch in POSTERIOR_ALPHA_CHANNELS if ch in raw.ch_names]
+    if len(channels) < 3:
+        raise ValueError(
+            "Not enough posterior channels for alpha-based EO/EC inference: "
+            f"found {channels}"
+        )
+
+    sfreq = float(raw.info["sfreq"])
+    start = max(0, int(np.ceil(start_sec * sfreq)))
+    stop = min(raw.n_times, int(np.floor(end_sec * sfreq)))
+    if stop - start < int(2 * sfreq):
+        raise ValueError("STATUS candidate block is too short for alpha inference.")
+
+    data = raw.get_data(picks=channels, start=start, stop=stop).astype(np.float64)
+    data -= data.mean(axis=1, keepdims=True)
+    n = data.shape[1]
+    window = np.hanning(n)[None, :]
+    spectrum = np.fft.rfft(data * window, axis=1)
+    power = np.abs(spectrum) ** 2
+    freqs = np.fft.rfftfreq(n, d=1.0 / sfreq)
+
+    alpha_mask = (freqs >= ALPHA_BAND_HZ[0]) & (freqs <= ALPHA_BAND_HZ[1])
+    ref_mask = (
+        (freqs >= ALPHA_REFERENCE_BAND_HZ[0])
+        & (freqs <= ALPHA_REFERENCE_BAND_HZ[1])
+    )
+    alpha = power[:, alpha_mask].sum(axis=1)
+    ref = power[:, ref_mask].sum(axis=1)
+    relative = alpha / np.maximum(ref, np.finfo(float).eps)
+    return float(np.median(relative))
+
+
+def _label_status_blocks_by_alpha(
+    raw: mne.io.BaseRaw,
+    blocks: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Infer EO/EC for STATUS-only event blocks from posterior alpha power.
+
+    For the common two-block case, the higher-alpha block is labelled EC and
+    the lower-alpha block EO. For more than two blocks, blocks are separated
+    into low/high-alpha groups using the largest gap in sorted log-alpha power.
+    If the two groups are not separated by at least ALPHA_INFERENCE_MIN_RATIO,
+    processing stops instead of guessing.
+    """
+    blocks = blocks.copy()
+    scores = np.asarray([
+        _posterior_relative_alpha(raw, float(r.start_sec), float(r.end_sec))
+        for r in blocks.itertuples()
+    ], dtype=float)
+
+    if len(scores) < 2 or np.any(~np.isfinite(scores)) or np.any(scores <= 0):
+        raise ValueError("Cannot infer EO/EC from STATUS events: invalid alpha scores.")
+
+    order = np.argsort(scores)
+    log_scores = np.log(scores[order])
+    gaps = np.diff(log_scores)
+    split = int(np.argmax(gaps)) + 1
+    low_idx = order[:split]
+    high_idx = order[split:]
+    if len(low_idx) == 0 or len(high_idx) == 0:
+        raise ValueError("Cannot form EO/EC alpha groups from STATUS blocks.")
+
+    low_center = float(np.median(scores[low_idx]))
+    high_center = float(np.median(scores[high_idx]))
+    ratio = high_center / max(low_center, np.finfo(float).eps)
+    if ratio < ALPHA_INFERENCE_MIN_RATIO:
+        raise ValueError(
+            "STATUS EO/EC alpha inference is ambiguous: "
+            f"high/low alpha ratio={ratio:.3f} < {ALPHA_INFERENCE_MIN_RATIO:.3f}."
+        )
+
+    blocks["posterior_relative_alpha"] = scores
+    blocks["alpha_group_ratio"] = ratio
+    blocks.loc[low_idx, "event_label"] = "Eyes Open"
+    blocks.loc[high_idx, "event_label"] = "Eyes Closed"
+    blocks["event_label_method"] = "status_trigger+posterior_alpha"
+
+    counters = {"EO": 0, "EC": 0}
+    ids = []
+    for label in blocks["event_label"]:
+        short = "EO" if label == "Eyes Open" else "EC"
+        counters[short] += 1
+        ids.append(f"{short}_block_{counters[short]:02d}")
+    blocks["event_block_id"] = ids
+    return blocks
+
+
+def load_event_blocks(
+    events_path: Path,
+    recording_end_sec: float,
+    raw: mne.io.BaseRaw | None = None,
+) -> pd.DataFrame:
+    """
+    Load PRED+CT EO/EC blocks.
+
+    Primary path: use explicit ``Eyes Open`` / ``Eyes Closed`` trial_type text.
+    Fallback path: for STATUS-only files, recover candidate blocks from paired
+    triggers 1/11 ... 6/16, then infer EO versus EC from posterior alpha power.
     """
     if not events_path.exists():
         if REQUIRE_EVENTS_TSV:
@@ -211,142 +423,105 @@ def load_event_blocks(events_path: Path, recording_end_sec: float) -> pd.DataFra
     events = events.copy()
     events["onset"] = pd.to_numeric(events["onset"], errors="coerce")
     events["numeric_value"] = pd.to_numeric(events["value"], errors="coerce")
+    valid_numeric = events["onset"].notna() & events["numeric_value"].notna()
 
-    # BIDS events.tsv onset is already in seconds; do NOT divide by sfreq.
+    # 1) Preferred: explicit physiological labels.
     state_pattern = r"^(Eyes Open|Eyes Closed)"
-    events["event_label"] = (
-        events["trial_type"].astype(str).str.extract(state_pattern)[0]
-    )
-    events = events[
-        events["event_label"].isin(EVENT_STATE_PREFIXES)
-        & events["onset"].notna()
-        & events["numeric_value"].notna()
+    events["event_label"] = events["trial_type"].astype(str).str.extract(state_pattern)[0]
+    labelled = events[
+        valid_numeric & events["event_label"].isin(EVENT_STATE_PREFIXES)
     ].copy()
 
-    if events.empty:
-        raise ValueError(
-            f"No Eyes Open / Eyes Closed events found in {events_path.name}"
+    if not labelled.empty:
+        blocks = _construct_contiguous_blocks(labelled, recording_end_sec, labelled=True)
+    else:
+        # 2) Fallback: STATUS-only paired trigger streams. Ignore markers such
+        # as value 17 because they indicate boundaries rather than EO/EC state.
+        if not ALLOW_STATUS_ALPHA_FALLBACK:
+            raise ValueError(f"No Eyes Open / Eyes Closed events found in {events_path.name}")
+        if raw is None:
+            raise ValueError(
+                "STATUS-only events require the preprocessed Raw object for "
+                "posterior-alpha EO/EC inference."
+            )
+
+        status = events[valid_numeric].copy()
+        status["canonical_code"] = status["numeric_value"].map(_canonical_predct_code)
+        status = status[status["canonical_code"].isin(STATUS_VALID_LOW_CODES)].copy()
+        if status.empty:
+            raise ValueError(
+                f"No explicit EO/EC labels and no usable STATUS trigger pairs "
+                f"were found in {events_path.name}."
+            )
+        status["event_label"] = "Unknown"
+        blocks = _construct_contiguous_blocks(status, recording_end_sec, labelled=False)
+        blocks = _label_status_blocks_by_alpha(raw, blocks)
+
+    # Blocks shorter than one analysis window cannot generate any saved 1-s
+    # sample. PRED+CT occasionally contains isolated/boundary triggers near the
+    # end of a recording (for example a ~0.5-s EC marker after a long EO block).
+    # Keeping such blocks only creates artificial boundary-overlap errors.
+    blocks = blocks.copy()
+    blocks["duration_sec"] = blocks["end_sec"] - blocks["start_sec"]
+    short_mask = blocks["duration_sec"] + 1e-9 < MIN_EVENT_BLOCK_SEC
+    if short_mask.any():
+        dropped = blocks.loc[short_mask, [
+            "event_block_id", "start_sec", "end_sec", "duration_sec"
+        ]].copy()
+        warnings.warn(
+            "Dropping event blocks shorter than one analysis window: "
+            + "; ".join(
+                f"{r.event_block_id}[{r.start_sec:.3f},{r.end_sec:.3f}) "
+                f"duration={r.duration_sec:.3f}s"
+                for r in dropped.itertuples()
+            ),
+            RuntimeWarning,
         )
+        blocks = blocks.loc[~short_mask].copy().reset_index(drop=True)
 
-    # Pair high-code and low-code trigger streams: 11->1, ..., 16->6.
-    def canonical_code(value: float) -> int:
-        code = int(round(value))
-        return code - 10 if 11 <= code <= 16 else code
-
-    events["event_code"] = events["numeric_value"].map(canonical_code)
-
-    # Infer how long each periodic marker supports from its description.
-    cadence_ms = pd.to_numeric(
-        events["trial_type"].astype(str).str.extract(
-            r"Every\s+(\d+)\s*ms"
-        )[0],
-        errors="coerce",
-    )
-    events["marker_interval_sec"] = cadence_ms / 1000.0
-    events["marker_interval_sec"] = (
-        events["marker_interval_sec"].fillna(WINDOW_SECONDS)
-    )
-    events["marker_end"] = (
-        events["onset"] + events["marker_interval_sec"]
-    )
-
-    # Sort chronologically before constructing contiguous runs.
-    events = events.sort_values(
-        ["onset", "event_label", "event_code"]
-    ).reset_index(drop=True)
-
-    # Assign a contiguous block number.
-    block_numbers = []
-    current_block = 0
-    prev_label = None
-    prev_code = None
-    prev_onset = None
-
-    for _, row in events.iterrows():
-        label = str(row["event_label"])
-        code = int(row["event_code"])
-        onset = float(row["onset"])
-
-        new_block = (
-            prev_label is None
-            or label != prev_label
-            or code != prev_code
-            or (onset - prev_onset) > EVENT_BLOCK_MAX_GAP_SEC
-        )
-
-        if new_block:
-            current_block += 1
-
-        block_numbers.append(current_block)
-        prev_label = label
-        prev_code = code
-        prev_onset = onset
-
-    events["contiguous_block"] = block_numbers
-
-    blocks = []
-    state_running_index = {"EO": 0, "EC": 0}
-
-    for _, group in events.groupby("contiguous_block", sort=True):
-        event_label = str(group["event_label"].iloc[0])
-        event_code = int(group["event_code"].iloc[0])
-        state_short = "EO" if event_label == "Eyes Open" else "EC"
-
-        start_sec = float(group["onset"].min())
-        end_sec = float(group["marker_end"].max())
-        end_sec = min(end_sec, float(recording_end_sec))
-
-        if end_sec <= start_sec:
-            continue
-
-        state_running_index[state_short] += 1
-        block_index = state_running_index[state_short]
-
-        trigger_values = sorted(
-            {int(round(v)) for v in group["numeric_value"]}
-        )
-
-        blocks.append(
-            {
-                "event_label": event_label,
-                "event_code": event_code,
-                "event_block_id": (
-                    f"{state_short}_block_{block_index:02d}"
-                ),
-                "event_trigger_values": "|".join(
-                    map(str, trigger_values)
-                ),
-                "start_sec": start_sec,
-                "end_sec": end_sec,
-            }
-        )
-
-    blocks = pd.DataFrame(blocks)
     if blocks.empty:
-        raise ValueError(
-            f"No valid event blocks could be constructed from "
-            f"{events_path.name}"
-        )
+        raise ValueError("No event blocks long enough to contain a complete window.")
 
-    blocks = blocks.sort_values("start_sec").reset_index(drop=True)
-
-    # Safety check. With contiguous construction this should normally never fire.
+    # Repair only small boundary overlaps. These usually come from assigning a
+    # cadence-sized support interval to the last periodic trigger in a block.
+    # Trimming the earlier block to the next onset prevents duplicated samples
+    # while preserving every full 1-s window that can be labelled unambiguously.
+    blocks["boundary_trimmed_sec"] = 0.0
     tolerance = 1e-6
     for i in range(len(blocks) - 1):
         current_end = float(blocks.loc[i, "end_sec"])
         next_start = float(blocks.loc[i + 1, "start_sec"])
+        overlap = current_end - next_start
 
-        if current_end > next_start + tolerance:
-            raise ValueError(
-                "Constructed event blocks still overlap after contiguous "
-                "segmentation: "
-                f"{blocks.loc[i, 'event_block_id']} "
-                f"[{blocks.loc[i, 'start_sec']:.3f}, {current_end:.3f}) and "
-                f"{blocks.loc[i + 1, 'event_block_id']} "
-                f"[{next_start:.3f}, "
-                f"{blocks.loc[i + 1, 'end_sec']:.3f}). "
-                "Please inspect this recording's events.tsv."
-            )
+        if overlap > tolerance:
+            if overlap <= MAX_AUTO_TRIM_OVERLAP_SEC + tolerance:
+                blocks.loc[i, "end_sec"] = next_start
+                blocks.loc[i, "boundary_trimmed_sec"] += overlap
+                blocks.loc[i, "duration_sec"] = (
+                    blocks.loc[i, "end_sec"] - blocks.loc[i, "start_sec"]
+                )
+            else:
+                raise ValueError(
+                    "Constructed event blocks have a large overlap that cannot "
+                    "be repaired safely: "
+                    f"{blocks.loc[i, 'event_block_id']} "
+                    f"[{blocks.loc[i, 'start_sec']:.3f}, {current_end:.3f}) and "
+                    f"{blocks.loc[i + 1, 'event_block_id']} "
+                    f"[{next_start:.3f}, {blocks.loc[i + 1, 'end_sec']:.3f}); "
+                    f"overlap={overlap:.3f}s > "
+                    f"{MAX_AUTO_TRIM_OVERLAP_SEC:.3f}s."
+                )
+
+    # A trim can theoretically make a marginal block too short. Drop it as it
+    # cannot contribute a complete window anyway, then verify the final blocks.
+    blocks["duration_sec"] = blocks["end_sec"] - blocks["start_sec"]
+    blocks = blocks[
+        blocks["duration_sec"] + 1e-9 >= MIN_EVENT_BLOCK_SEC
+    ].copy().reset_index(drop=True)
+
+    for i in range(len(blocks) - 1):
+        if float(blocks.loc[i, "end_sec"]) > float(blocks.loc[i + 1, "start_sec"]) + tolerance:
+            raise RuntimeError("Internal error: repaired event blocks still overlap.")
 
     return blocks
 
@@ -800,7 +975,11 @@ def save_npz(
         "target_sfreq": TARGET_SFREQ,
         "window_seconds": WINDOW_SECONDS,
         "windowing": "event-aware; windows never cross event-block boundaries",
-        "event_label_source": "events.tsv trial_type, grouped to Eyes Open / Eyes Closed blocks",
+        "event_label_source": (
+            str(event_blocks["event_label_method"].iloc[0])
+            if "event_label_method" in event_blocks.columns and len(event_blocks)
+            else "unknown"
+        ),
         "event_marker_grouping": "paired repeated markers such as 2/12 and 1/11 belong to the same state block",
         "unlabelled_gaps": "discarded",
         "incomplete_boundary_remainders": "discarded",
@@ -972,6 +1151,7 @@ def process_one_recording(
     event_blocks = load_event_blocks(
         sidecars["events"],
         recording_end_sec=float(raw.n_times / raw.info["sfreq"]),
+        raw=raw,
     )
 
     # 10) Event-aware non-overlapping 1-s windows.
@@ -1044,6 +1224,11 @@ def process_one_recording(
         "eyes_open_windows": state_counts.get("EO", 0),
         "eyes_closed_windows": state_counts.get("EC", 0),
         "event_blocks": int(len(event_blocks)),
+        "event_label_method": (
+            str(event_blocks["event_label_method"].iloc[0])
+            if "event_label_method" in event_blocks.columns and len(event_blocks)
+            else "unknown"
+        ),
         "bad_channels": ",".join(bad_channels) if bad_channels else "",
         "bad_z_scores_json": json.dumps(
             {ch: bad_z_scores[ch] for ch in bad_channels},
