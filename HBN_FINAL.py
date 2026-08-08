@@ -102,7 +102,7 @@ ICA_MIN_ABS_EOG_SCORE = 0.6
 
 # HBN resting-state SET has no dedicated EOG channels in the 129-channel file.
 ICA_FRONTAL_PROXY_CHANNELS = ["Fp1", "Fpz", "Fp2"]
-USE_FRONTAL_PROXY_ICA = False
+USE_FRONTAL_PROXY_ICA = True
 
 WINDOW_SECONDS = 1.0
 APPLY_BASELINE = True

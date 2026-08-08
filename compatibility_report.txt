@@ -1,0 +1,28 @@
+EEG DATASET CONSISTENCY REPORT
+==============================================================================
+Goal: HBN + MODMA + PRED+CT for pretraining; TDBRAIN downstream only.
+
+[PASS] HBN, MODMA and PRED+CT have identical 64-channel names and order.
+[PASS] The three candidate pretraining files are Eyes Closed only.
+[PASS] Stored FC tensors satisfy shape/symmetry/recomputation checks for pretraining.
+[PASS] All 26 TDBRAIN EEG channels are a subset of the pretraining 64 channels.
+[PASS] Preprocessing field 'bandpass_hz' is aligned: [0.5, 45.0]
+[PASS] Preprocessing field 'reference' is aligned: common average reference
+[PASS] Preprocessing field 'baseline_correction' is aligned: whole-window mean
+[PASS] Preprocessing field 'bad_channel_method' is aligned: robust z-score of log(SD), |z| > 6.0
+[PASS] Preprocessing field 'interpolation_method' is aligned: 3-nearest-electrode inverse-distance weighted average
+[PASS] ICA is aligned at the algorithm level: HBN, MODMA and PRED+CT all use FastICA.
+[INFO] ICA component-scoring descriptions differ slightly across datasets: HBN=FastICA with frontal EEG proxy scoring, MODMA=FastICA with frontal EEG proxy scoring, PRED_CT=FastICA
+[INFO] Notch frequencies differ (50/60 Hz). This is normally acceptable when matched to mains frequency, especially because the final bandpass is 0.5-45 Hz.
+[PASS] Median window RMS scale ratio is 1.64x across pretraining datasets.
+[RESULT] STRUCTURAL COMPATIBILITY = PASS. HBN + MODMA + PRED+CT can be concatenated for pretraining under the current tensor contract.
+[RESULT] TDBRAIN should remain downstream-only; map/freeze the encoder using its 26-channel subset rather than padding it into the 64-channel pretraining pool unless your architecture explicitly supports channel masking.
+
+Shared downstream channel order:
+Fp1, Fp2, F7, F3, Fz, F4, F8, FC3, FCz, FC4, T7, C3, Cz, C4, T8, CP3, CPz, CP4, P7, P3, Pz, P4, P8, O1, Oz, O2
+
+Interpretation:
+- FAIL  : must fix before mixed pretraining.
+- WARN  : structurally usable, but domain/preprocessing mismatch may bias SSL.
+- INFO  : expected/non-blocking difference.
+- PASS  : aligned with the intended tensor/data contract.

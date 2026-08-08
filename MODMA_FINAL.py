@@ -141,7 +141,7 @@ ICA_MIN_ABS_EOG_SCORE = 0.6
 # E1-E128 + Cz layout. These HydroCel electrodes are near the frontal pole and
 # are used only as conservative ocular-reference proxies for ICA scoring.
 ICA_FRONTAL_PROXY_CHANNELS = ["Fp1", "Fpz", "Fp2"]
-USE_FRONTAL_PROXY_ICA = False
+USE_FRONTAL_PROXY_ICA = True
 
 WINDOW_SECONDS = 1.0
 APPLY_BASELINE = True
