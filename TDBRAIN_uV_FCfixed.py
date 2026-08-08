@@ -25,6 +25,8 @@ Saved arrays
 data : (N, 26, 250)
 fc   : (N, 26, 26)
 
+Saved EEG amplitudes are in microvolts (uV).
+
 The core preprocessing is intentionally kept aligned with the supplied
 PRED+CT script:
     notch -> 0.5-45 Hz Butterworth IIR -> 250 Hz
@@ -102,6 +104,11 @@ ICA_EOG_THRESHOLD = 3.0
 
 WINDOW_SECONDS = 1.0
 APPLY_BASELINE = True
+
+# MNE internally uses volts. Keep all preprocessing in volts, then
+# convert only the final exported EEG windows to microvolts (uV).
+OUTPUT_EEG_SCALE = 1e6
+OUTPUT_EEG_UNIT = "uV"
 
 # Same resume behavior as the supplied PRED+CT script.
 OVERWRITE = False
@@ -734,6 +741,9 @@ def make_one_second_ec_windows(
             )
         )
 
+    # MNE data are in volts. Export final windows in microvolts.
+    data = data * OUTPUT_EEG_SCALE
+
     data = np.asarray(
         data,
         dtype=np.float32,
@@ -848,6 +858,20 @@ def compute_pearson_fc(
         * norms[:, None, :]
     )
 
+    # Do not use float32.eps as an absolute zero threshold.
+    # A channel is invalid only when its norm is effectively zero.
+    valid_channel = (
+        norms
+        > np.finfo(
+            np.float32
+        ).tiny
+    )
+
+    valid_pair = (
+        valid_channel[:, :, None]
+        & valid_channel[:, None, :]
+    )
+
     fc = np.zeros_like(
         numerator,
         dtype=np.float32,
@@ -857,12 +881,7 @@ def compute_pearson_fc(
         numerator,
         denominator,
         out=fc,
-        where=(
-            denominator
-            > np.finfo(
-                np.float32
-            ).eps
-        ),
+        where=valid_pair,
     )
 
     fc = np.nan_to_num(
@@ -888,6 +907,22 @@ def compute_pearson_fc(
         diag,
         diag,
     ] = 0.0
+
+    # Prevent silent generation of broken all-zero FC batches.
+    zero_fraction = float(
+        np.mean(
+            np.all(
+                fc == 0.0,
+                axis=(1, 2),
+            )
+        )
+    )
+
+    if zero_fraction > 0.95:
+        raise RuntimeError(
+            f"FC sanity check failed: {zero_fraction:.1%} "
+            "of FC matrices are completely zero."
+        )
 
     return fc
 
@@ -952,7 +987,8 @@ def save_npz(
         "session_id": session_id,
         "shape": list(data.shape),
         "fc_shape": list(fc.shape),
-        "data_unit": "V",
+        "data_unit": OUTPUT_EEG_UNIT,
+        "data_scale_from_mne_volts": OUTPUT_EEG_SCALE,
         "functional_connectivity": (
             "Pearson correlation computed independently "
             "for each 1-s EEG window"
@@ -1070,7 +1106,7 @@ def save_npz(
             dtype=np.float32,
         ),
         data_unit=np.asarray(
-            "V",
+            OUTPUT_EEG_UNIT,
             dtype=np.str_,
         ),
         source_file=np.asarray(

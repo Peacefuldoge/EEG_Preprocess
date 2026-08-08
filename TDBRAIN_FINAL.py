@@ -25,6 +25,8 @@ Saved arrays
 data : (N, 26, 250)
 fc   : (N, 26, 26)
 
+Saved EEG amplitudes are in microvolts (uV).
+
 The core preprocessing is intentionally kept aligned with the supplied
 PRED+CT script:
     notch -> 0.5-45 Hz Butterworth IIR -> 250 Hz
@@ -98,13 +100,38 @@ ICA_MAX_OCULAR_COMPONENTS = 2
 ICA_FIT_SECONDS = 30.0
 ICA_RANDOM_STATE = 97
 ICA_MAX_ITER = 300
-ICA_EOG_THRESHOLD = 3.0
+ICA_EOG_THRESHOLD = 2.5
+ICA_MIN_ABS_EOG_SCORE = 0.6
 
 WINDOW_SECONDS = 1.0
 APPLY_BASELINE = True
 
+# MNE internally uses volts. Keep all preprocessing in volts, then
+# convert only the final exported EEG windows to microvolts (uV).
+OUTPUT_EEG_SCALE = 1e6
+OUTPUT_EEG_UNIT = "uV"
+
+# -------------------------------------------------------------------------
+# Final window-level artifact rejection (saved EEG is in uV)
+# -------------------------------------------------------------------------
+WINDOW_QC_ENABLED = True
+
+# Hard rejection limits for resting scalp EEG.
+WINDOW_QC_MAX_ABS_UV = 200.0
+WINDOW_QC_MAX_P2P_UV = 400.0
+WINDOW_QC_MIN_RMS_UV = 0.05
+
+# Subject/run-adaptive rejection. These are deliberately conservative.
+WINDOW_QC_ROBUST_Z_THRESHOLD = 8.0
+WINDOW_QC_MIN_WINDOWS_FOR_ROBUST = 20
+
+# If QC removes a large fraction, keep the recording out of the dataset
+# rather than silently accepting a severely contaminated recording.
+WINDOW_QC_WARN_REMOVAL_FRACTION = 0.20
+WINDOW_QC_MIN_KEEP_FRACTION = 0.50
+
 # Same resume behavior as the supplied PRED+CT script.
-OVERWRITE = False
+OVERWRITE = True
 
 
 # =============================================================================
@@ -614,6 +641,7 @@ def run_ica_ocular_removal(
             scores = np.asarray(scores)
 
             for idx in inds:
+                idx = int(idx)
                 score = (
                     float(abs(scores[idx]))
                     if idx < len(scores)
@@ -632,15 +660,27 @@ def run_ica_ocular_removal(
             # one problematic EOG channel should not abort a recording.
             continue
 
+    # ranked = sorted(
+    #     candidate_scores,
+    #     key=candidate_scores.get,
+    #     reverse=True,
+    # )
+
+    # exclude = ranked[
+    #     :ICA_MAX_OCULAR_COMPONENTS
+    # ]
+    
     ranked = sorted(
         candidate_scores,
         key=candidate_scores.get,
         reverse=True,
     )
 
-    exclude = ranked[
-        :ICA_MAX_OCULAR_COMPONENTS
-    ]
+    exclude = [
+        int(idx)
+        for idx in ranked
+        if float(candidate_scores[idx]) >= ICA_MIN_ABS_EOG_SCORE
+    ][:ICA_MAX_OCULAR_COMPONENTS]
 
     if exclude:
         ica.exclude = exclude
@@ -734,6 +774,9 @@ def make_one_second_ec_windows(
             )
         )
 
+    # MNE data are in volts. Export final windows in microvolts.
+    data = data * OUTPUT_EEG_SCALE
+
     data = np.asarray(
         data,
         dtype=np.float32,
@@ -796,6 +839,294 @@ def make_one_second_ec_windows(
     )
 
 
+
+def _window_qc_robust_z(values: np.ndarray) -> np.ndarray:
+    """One-sided robust z-score used for unusually large window metrics."""
+    values = np.asarray(values, dtype=np.float64)
+
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+
+    if not np.isfinite(mad) or mad < np.finfo(float).eps:
+        return np.zeros_like(values, dtype=np.float64)
+
+    return (
+        0.67448975
+        * (values - median)
+        / mad
+    )
+
+
+def reject_artifact_windows(
+    data_uv: np.ndarray,
+    starts: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    """
+    Detect severe 1-s EEG artifacts after all preprocessing and uV conversion.
+
+    The detector combines:
+      1) absolute hard limits:
+           max |amplitude| > 200 uV
+           worst-channel peak-to-peak > 400 uV
+           global RMS < 0.05 uV (near-flat window)
+      2) adaptive high-outlier detection using robust z-scores of:
+           global RMS
+           max |amplitude|
+           worst-channel peak-to-peak
+
+    Robust-z rejection is enabled only when enough windows are available.
+    The returned boolean mask indexes the *pre-QC* windows.
+    """
+    if data_uv.ndim != 3:
+        raise ValueError(
+            f"Window QC expected (N,C,T), got {data_uv.shape}"
+        )
+
+    n_windows = int(data_uv.shape[0])
+
+    if n_windows == 0:
+        raise ValueError("Window QC received zero windows.")
+
+    if not WINDOW_QC_ENABLED:
+        return (
+            np.ones(n_windows, dtype=bool),
+            {
+                "enabled": False,
+                "n_before": n_windows,
+                "n_kept": n_windows,
+                "n_removed": 0,
+                "removed_fraction": 0.0,
+                "removed_indices": [],
+                "removed_window_start_sec": [],
+            },
+        )
+
+    x = np.asarray(
+        data_uv,
+        dtype=np.float64,
+    )
+
+    if not np.all(np.isfinite(x)):
+        # Non-finite windows are never allowed into model training.
+        finite_window = np.all(
+            np.isfinite(x),
+            axis=(1, 2),
+        )
+    else:
+        finite_window = np.ones(
+            n_windows,
+            dtype=bool,
+        )
+
+    # Replace non-finite values only for metric calculation. Such windows are
+    # still rejected through finite_window below.
+    x_safe = np.nan_to_num(
+        x,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    rms_uv = np.sqrt(
+        np.mean(
+            x_safe * x_safe,
+            axis=(1, 2),
+        )
+    )
+
+    max_abs_uv = np.max(
+        np.abs(x_safe),
+        axis=(1, 2),
+    )
+
+    # Maximum channel-wise peak-to-peak value within each 1-s window.
+    max_p2p_uv = np.max(
+        np.ptp(
+            x_safe,
+            axis=2,
+        ),
+        axis=1,
+    )
+
+    hard_nonfinite = ~finite_window
+    hard_flat = rms_uv < WINDOW_QC_MIN_RMS_UV
+    hard_amplitude = max_abs_uv > WINDOW_QC_MAX_ABS_UV
+    hard_p2p = max_p2p_uv > WINDOW_QC_MAX_P2P_UV
+
+    if n_windows >= WINDOW_QC_MIN_WINDOWS_FOR_ROBUST:
+        rms_z = _window_qc_robust_z(rms_uv)
+        max_abs_z = _window_qc_robust_z(max_abs_uv)
+        p2p_z = _window_qc_robust_z(max_p2p_uv)
+
+        robust_rms = rms_z > WINDOW_QC_ROBUST_Z_THRESHOLD
+        robust_amplitude = (
+            max_abs_z > WINDOW_QC_ROBUST_Z_THRESHOLD
+        )
+        robust_p2p = p2p_z > WINDOW_QC_ROBUST_Z_THRESHOLD
+    else:
+        rms_z = np.zeros(n_windows, dtype=np.float64)
+        max_abs_z = np.zeros(n_windows, dtype=np.float64)
+        p2p_z = np.zeros(n_windows, dtype=np.float64)
+
+        robust_rms = np.zeros(n_windows, dtype=bool)
+        robust_amplitude = np.zeros(n_windows, dtype=bool)
+        robust_p2p = np.zeros(n_windows, dtype=bool)
+
+    reject = (
+        hard_nonfinite
+        | hard_flat
+        | hard_amplitude
+        | hard_p2p
+        | robust_rms
+    )
+
+    keep = ~reject
+
+    n_removed = int(np.sum(reject))
+    n_kept = int(np.sum(keep))
+    removed_fraction = (
+        n_removed / n_windows
+    )
+
+    if n_kept == 0:
+        raise RuntimeError(
+            "Window QC rejected every EEG window."
+        )
+
+    if (
+        n_kept / n_windows
+        < WINDOW_QC_MIN_KEEP_FRACTION
+    ):
+        raise RuntimeError(
+            "Window QC rejected too much of the recording: "
+            f"kept {n_kept}/{n_windows} "
+            f"({n_kept / n_windows:.1%}), below minimum "
+            f"{WINDOW_QC_MIN_KEEP_FRACTION:.1%}. "
+            "Review the raw recording instead of training on it."
+        )
+
+    if (
+        removed_fraction
+        > WINDOW_QC_WARN_REMOVAL_FRACTION
+    ):
+        warnings.warn(
+            "Window QC removed a large fraction of this recording: "
+            f"{n_removed}/{n_windows} "
+            f"({removed_fraction:.1%}).",
+            RuntimeWarning,
+        )
+
+    removed_indices = np.flatnonzero(
+        reject
+    )
+
+    if starts is not None:
+        starts = np.asarray(
+            starts,
+            dtype=np.float64,
+        )
+        if len(starts) != n_windows:
+            raise ValueError(
+                "starts length does not match the number of windows."
+            )
+        removed_start_sec = [
+            float(x)
+            for x in starts[reject]
+        ]
+    else:
+        removed_start_sec = []
+
+    # Keep per-removed-window metrics for auditability. This is normally a
+    # small list and is stored only in metadata_json.
+    removed_details = []
+
+    for idx in removed_indices:
+        reasons = []
+
+        if hard_nonfinite[idx]:
+            reasons.append("nonfinite")
+        if hard_flat[idx]:
+            reasons.append("near_flat")
+        if hard_amplitude[idx]:
+            reasons.append("max_abs")
+        if hard_p2p[idx]:
+            reasons.append("peak_to_peak")
+        if robust_rms[idx]:
+            reasons.append("rms_robust_z")
+        if robust_amplitude[idx]:
+            reasons.append("max_abs_robust_z")
+        if robust_p2p[idx]:
+            reasons.append("p2p_robust_z")
+
+        removed_details.append({
+            "index_before_qc": int(idx),
+            "start_sec": (
+                float(starts[idx])
+                if starts is not None
+                else None
+            ),
+            "rms_uV": float(rms_uv[idx]),
+            "max_abs_uV": float(max_abs_uv[idx]),
+            "max_p2p_uV": float(max_p2p_uv[idx]),
+            "rms_robust_z": float(rms_z[idx]),
+            "max_abs_robust_z": float(max_abs_z[idx]),
+            "p2p_robust_z": float(p2p_z[idx]),
+            "reasons": reasons,
+        })
+
+    qc_info = {
+        "enabled": True,
+        "n_before": n_windows,
+        "n_kept": n_kept,
+        "n_removed": n_removed,
+        "removed_fraction": float(
+            removed_fraction
+        ),
+        "thresholds": {
+            "max_abs_uV": WINDOW_QC_MAX_ABS_UV,
+            "max_p2p_uV": WINDOW_QC_MAX_P2P_UV,
+            "min_rms_uV": WINDOW_QC_MIN_RMS_UV,
+            "robust_z_threshold": WINDOW_QC_ROBUST_Z_THRESHOLD,
+            "min_windows_for_robust": WINDOW_QC_MIN_WINDOWS_FOR_ROBUST,
+            "minimum_keep_fraction": WINDOW_QC_MIN_KEEP_FRACTION,
+        },
+        "metric_summary_before_qc": {
+            "median_rms_uV": float(np.median(rms_uv)),
+            "median_max_abs_uV": float(np.median(max_abs_uv)),
+            "median_max_p2p_uV": float(np.median(max_p2p_uv)),
+            "max_abs_uV": float(np.max(max_abs_uv)),
+            "max_p2p_uV": float(np.max(max_p2p_uv)),
+        },
+        "reason_counts": {
+            "nonfinite": int(np.sum(hard_nonfinite)),
+            "near_flat": int(np.sum(hard_flat)),
+            "max_abs": int(np.sum(hard_amplitude)),
+            "peak_to_peak": int(np.sum(hard_p2p)),
+            "rms_robust_z": int(np.sum(robust_rms)),
+            "max_abs_robust_z": int(np.sum(robust_amplitude)),
+            "p2p_robust_z": int(np.sum(robust_p2p)),
+        },
+        "removed_indices": [
+            int(x)
+            for x in removed_indices
+        ],
+        "removed_window_start_sec": removed_start_sec,
+        "removed_details": removed_details,
+    }
+
+    return keep, qc_info
+
+
+def _apply_window_mask(
+    keep: np.ndarray,
+    *arrays: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    """Apply one QC keep mask to all per-window arrays."""
+    return tuple(
+        np.asarray(array)[keep]
+        for array in arrays
+    )
+
 def compute_pearson_fc(
     windows: np.ndarray,
 ) -> np.ndarray:
@@ -848,6 +1179,20 @@ def compute_pearson_fc(
         * norms[:, None, :]
     )
 
+    # Do not use float32.eps as an absolute zero threshold.
+    # A channel is invalid only when its norm is effectively zero.
+    valid_channel = (
+        norms
+        > np.finfo(
+            np.float32
+        ).tiny
+    )
+
+    valid_pair = (
+        valid_channel[:, :, None]
+        & valid_channel[:, None, :]
+    )
+
     fc = np.zeros_like(
         numerator,
         dtype=np.float32,
@@ -857,12 +1202,7 @@ def compute_pearson_fc(
         numerator,
         denominator,
         out=fc,
-        where=(
-            denominator
-            > np.finfo(
-                np.float32
-            ).eps
-        ),
+        where=valid_pair,
     )
 
     fc = np.nan_to_num(
@@ -888,6 +1228,22 @@ def compute_pearson_fc(
         diag,
         diag,
     ] = 0.0
+
+    # Prevent silent generation of broken all-zero FC batches.
+    zero_fraction = float(
+        np.mean(
+            np.all(
+                fc == 0.0,
+                axis=(1, 2),
+            )
+        )
+    )
+
+    if zero_fraction > 0.95:
+        raise RuntimeError(
+            f"FC sanity check failed: {zero_fraction:.1%} "
+            "of FC matrices are completely zero."
+        )
 
     return fc
 
@@ -916,6 +1272,7 @@ def save_npz(
     ica_excluded: list[int],
     ica_converged: bool,
     label_table_path: Path,
+    window_qc: dict,
 ) -> None:
     n_windows = data.shape[0]
 
@@ -952,7 +1309,8 @@ def save_npz(
         "session_id": session_id,
         "shape": list(data.shape),
         "fc_shape": list(fc.shape),
-        "data_unit": "V",
+        "data_unit": OUTPUT_EEG_UNIT,
+        "data_scale_from_mne_volts": OUTPUT_EEG_SCALE,
         "functional_connectivity": (
             "Pearson correlation computed independently "
             "for each 1-s EEG window"
@@ -1023,6 +1381,7 @@ def save_npz(
             if APPLY_BASELINE
             else "none"
         ),
+        "window_qc": window_qc,
     }
 
     np.savez_compressed(
@@ -1070,7 +1429,7 @@ def save_npz(
             dtype=np.float32,
         ),
         data_unit=np.asarray(
-            "V",
+            OUTPUT_EEG_UNIT,
             dtype=np.str_,
         ),
         source_file=np.asarray(
@@ -1317,12 +1676,50 @@ def process_one_recording(
         raw
     )
 
-    # 10) Pearson FC for every EEG window.
+    # 10) Final 1-s window-level artifact rejection.
+    n_windows_before_qc = int(
+        data.shape[0]
+    )
+
+    keep_windows, window_qc = (
+        reject_artifact_windows(
+            data,
+            starts=starts,
+        )
+    )
+
+    (
+        data,
+        starts,
+        ends,
+        labels,
+        event_codes,
+        event_block_ids,
+        event_block_starts,
+        event_block_ends,
+    ) = _apply_window_mask(
+        keep_windows,
+        data,
+        starts,
+        ends,
+        labels,
+        event_codes,
+        event_block_ids,
+        event_block_starts,
+        event_block_ends,
+    )
+
+    n_windows_removed_qc = (
+        n_windows_before_qc
+        - int(data.shape[0])
+    )
+
+    # 11) Pearson FC only for windows that survive QC.
     fc = compute_pearson_fc(
         data
     )
 
-    # 11) Save in a PRED+CT-compatible NPZ structure.
+    # 12) Save in a PRED+CT-compatible NPZ structure.
     save_npz(
         output_path=output_path,
         data=data,
@@ -1343,6 +1740,7 @@ def process_one_recording(
         ica_excluded=ica_excluded,
         ica_converged=ica_converged,
         label_table_path=label_table_path,
+        window_qc=window_qc,
     )
 
     result = {
@@ -1358,6 +1756,8 @@ def process_one_recording(
         "status": "OK",
         "original_sfreq": original_sfreq,
         "final_sfreq": TARGET_SFREQ,
+        "n_windows_before_qc": n_windows_before_qc,
+        "n_windows_removed_qc": n_windows_removed_qc,
         "n_windows": int(
             data.shape[0]
         ),
@@ -1604,7 +2004,8 @@ def main() -> None:
                     f"{result['session_id']} | "
                     f"{result['diagnosis']} | "
                     f"{result['n_windows']} windows | "
-                    "EEG=26x250 | FC=26x26"
+                    f"removed={result.get('n_windows_removed_qc', 0)} | "
+                    "EEG=26x250 uV | FC=26x26"
                 )
 
         except Exception as error:
