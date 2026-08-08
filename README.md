@@ -410,6 +410,6 @@ The EEG datasets used by this project are distributed by their respective owners
 
 ## Author
 
-**Zhenzuo Zhu**
+**ZHU ZHENZUO**
 
 Research project on self-supervised representation learning for EEG-based depression detection.
