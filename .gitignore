@@ -1,0 +1,83 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs / temporary files
+# =========================
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# =========================
+# EEG raw data
+# =========================
+*.bdf
+*.edf
+*.set
+*.fdt
+*.vhdr
+*.vmrk
+*.eeg
+
+# =========================
+# Preprocessed EEG data
+# =========================
+*.npz
+*.npy
+
+# =========================
+# Model checkpoints
+# =========================
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+runs/
+wandb/
+
+# =========================
+# Local datasets
+# =========================
+dataset/
+datasets/
+data/
+preprocessed/
+
+# =========================
+# Generated cache
+# =========================
+.cache/
+.mne/
