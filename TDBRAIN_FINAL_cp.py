@@ -1384,7 +1384,7 @@ def save_npz(
         "window_qc": window_qc,
     }
 
-    np.savez(
+    np.savez_compressed(
         output_path,
 
         # Identical core arrays to PRED+CT.

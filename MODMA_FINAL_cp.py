@@ -2,54 +2,79 @@
 # -*- coding: utf-8 -*-
 
 r"""
-TDBRAIN V3.1 batch EEG preprocessing, adapted directly from the finalized
-PRED+CT preprocessing script.
+MODMA 128-channel resting-state EEG preprocessing (.mat version).
 
-Expected structure
-------------------
-E:\Downloads\TDBRAIN_Dataset_V3_1_Encr\TDBRAIN_Dataset_V3_1\
-    sub-88006477\
-        ses-1\
-            eeg\
-                sub-88006477_ses-1_task-restEC_eeg.bdf
+Dataset
+-------
+EEG_128channels_resting_lanzhou_2015
 
-Only MDD / HEALTHY recordings listed in the participant spreadsheet are used.
+Expected input example
+----------------------
+E:\Workspace\dataset\modma\
+    EEG_128channels_resting_lanzhou_2015\
+    EEG_128channels_resting_lanzhou_2015\
+    data\
+        02010002.mat
+        ...
+
+MODMA resting-state .mat structure
+----------------------------------
+The official MODMA description states that EEG.data contains 129 signals:
+    EEG.data[0:128] -> electrodes E1 ... E128
+    EEG.data[128]   -> Cz reference channel
+
+This script maps the HydroCel E1-E128 + Cz layout onto the same fixed
+COMMON_64 channel configuration used by PRED+CT. Manufacturer 10-10
+equivalences are used where available; six additional PRED+CT positions
+(M1/M2/PO5/PO6/CB1/CB2) use fixed nearest-position HydroCel matches.
+
+Recording condition
+-------------------
+- Eyes-closed resting state
+- Approximately 5 minutes
+- Native sampling rate: 250 Hz
+- HydroCel Geodesic Sensor Net, 128 electrodes
+- Original reference: Cz
+
+Diagnosis from original filename
+--------------------------------
+0201xxxx.mat -> MDD
+0203xxxx.mat -> HEALTHY
 
 Output
 ------
-One compressed NPZ per TDBRAIN restEC recording:
-sub-88006477_ses-1_task-restEC_eeg_EC.npz
+One compressed NPZ per recording:
+    02010002_EC.npz
 
 Saved arrays
 ------------
-data : (N, 26, 250)
-fc   : (N, 26, 26)
+data : (N, 64, 250), float32, unit = microvolts (uV)
+fc   : (N, 64, 64), float32, Pearson correlation
 
-Saved EEG amplitudes are in microvolts (uV).
+N is the number of complete non-overlapping 1-s windows.
 
-The core preprocessing is intentionally kept aligned with the supplied
-PRED+CT script:
-    notch -> 0.5-45 Hz Butterworth IIR -> 250 Hz
-    -> robust-z bad-channel detection
-    -> 3-nearest-electrode interpolation
-    -> common-average reference
-    -> FastICA ocular removal
-    -> 1-s non-overlapping windows
-    -> whole-window mean baseline
-    -> Pearson FC
+Preprocessing
+-------------
+MAT -> MNE Raw (internally volts)
+-> 50-Hz notch
+-> 0.5-45 Hz Butterworth IIR
+-> resample to 250 Hz if needed
+-> robust-z bad-channel detection
+-> 3-nearest-electrode interpolation
+-> common-average reference
+-> conservative FastICA ocular removal using frontal EEG proxy channels
+-> complete non-overlapping 1-s EC windows
+-> whole-window mean baseline
+-> convert final saved EEG to uV
+-> Pearson FC for each window
 
-TDBRAIN-specific differences
------------------------------
-1. Input format is BDF.
-2. Power-line frequency is 50 Hz.
-3. Exactly 26 scalp EEG channels are retained.
-4. Files are already task-restEC, so the full recording is one EC block.
-5. Disease labels come from the spreadsheet:
-       formal_status = HEALTHY / MDD
-       diagnosis_ids = 0 / 1
-6. For consistency with PRED+CT, ``labels`` retains physiological-state
-   semantics and is therefore "Eyes Closed"; disease labels are additionally
-   stored in ``diagnosis_labels`` and ``diagnosis_ids``.
+Notes
+-----
+1. Net Station / EEGLAB-style EEG.data is assumed to be stored in uV.
+   Change MAT_INPUT_UNIT if inspection of your files proves otherwise.
+2. MODMA resting files do not provide dedicated EOG channels in the published
+   129-signal layout. Therefore ocular ICA uses frontal EEG proxies and is
+   deliberately conservative (max two removed components).
 """
 
 from __future__ import annotations
@@ -64,6 +89,7 @@ import mne
 import numpy as np
 import pandas as pd
 from mne.preprocessing import ICA
+from scipy.io import loadmat
 from sklearn.exceptions import ConvergenceWarning
 from tqdm import tqdm
 
@@ -72,21 +98,29 @@ from tqdm import tqdm
 # 1. USER CONFIGURATION
 # =============================================================================
 
-DATASET_ROOT = Path(
-    r"E:/Downloads/TDBRAIN_Dataset_V3_1_Encr/TDBRAIN_Dataset_V3_1"
+DATA_DIR = Path(
+    r"E:\Workspace\dataset\modma"
+    r"\EEG_128channels_resting_lanzhou_2015"
+    r"\EEG_128channels_resting_lanzhou_2015"
+    r"\data"
 )
 
 OUTPUT_DIR = Path(
-    r"E:/Workspace/dataset/preprocessed/TDBRAIN"
+    r"E:\Workspace\dataset\preprocessed\MODMA"
 )
 
-DATASET_NAME = "TDBRAIN"
+# The example supplied by the user.
+SINGLE_TEST_FILE = DATA_DIR / "02010002.mat"
 
-# Fixed label table used for all runs.
-LABEL_TABLE_PATH = Path("E:/Workspace/EEG_Preprocess/TDBRAIN_MDD_HC.csv")
+# False = batch-process every *.mat in DATA_DIR.
+# True  = process only SINGLE_TEST_FILE.
+PROCESS_ONLY_SINGLE_TEST_FILE = False
 
-# Preprocessing -- intentionally matched to the supplied PRED+CT script.
+DATASET_NAME = "MODMA"
+
+# Native MODMA sampling rate is 250 Hz.
 TARGET_SFREQ = 250.0
+
 BANDPASS_LOW = 0.5
 BANDPASS_HIGH = 45.0
 DEFAULT_LINE_FREQ = 50.0
@@ -103,11 +137,20 @@ ICA_MAX_ITER = 300
 ICA_EOG_THRESHOLD = 2.5
 ICA_MIN_ABS_EOG_SCORE = 0.6
 
+# MODMA resting-state MAT files do not contain dedicated EOG in the published
+# E1-E128 + Cz layout. These HydroCel electrodes are near the frontal pole and
+# are used only as conservative ocular-reference proxies for ICA scoring.
+ICA_FRONTAL_PROXY_CHANNELS = ["Fp1", "Fpz", "Fp2"]
+USE_FRONTAL_PROXY_ICA = True
+
 WINDOW_SECONDS = 1.0
 APPLY_BASELINE = True
 
-# MNE internally uses volts. Keep all preprocessing in volts, then
-# convert only the final exported EEG windows to microvolts (uV).
+# Net Station / EEGLAB-style numeric EEG.data is normally represented in uV.
+# Accepted values: "uV" or "V".
+MAT_INPUT_UNIT = "uV"
+
+# MNE operates internally in volts; exported windows are converted to uV.
 OUTPUT_EEG_SCALE = 1e6
 OUTPUT_EEG_UNIT = "uV"
 
@@ -130,304 +173,562 @@ WINDOW_QC_MIN_WINDOWS_FOR_ROBUST = 20
 WINDOW_QC_WARN_REMOVAL_FRACTION = 0.20
 WINDOW_QC_MIN_KEEP_FRACTION = 0.50
 
-# Same resume behavior as the supplied PRED+CT script.
 OVERWRITE = True
 
 
 # =============================================================================
-# 2. FIXED TDBRAIN 26-CHANNEL ORDER
+# 2. FIXED 64-CHANNEL HARMONIZED CONFIGURATION
 # =============================================================================
 
-EEG_26 = [
-    "Fp1", "Fp2",
-    "F7", "F3", "Fz", "F4", "F8",
-    "FC3", "FCz", "FC4",
-    "T7", "C3", "Cz", "C4", "T8",
-    "CP3", "CPz", "CP4",
-    "P7", "P3", "Pz", "P4", "P8",
-    "O1", "Oz", "O2",
+# Exact final order used by PRED+CT. MODMA must match this order so that the
+# pretraining datasets share the same channel semantics and tensor shape.
+COMMON_64 = [
+    "Fp1", "Fpz", "Fp2", "AF3", "AF4",
+    "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8",
+    "FT7", "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "FT8",
+    "T7", "C5", "C3", "C1", "Cz", "C2", "C4", "C6", "T8",
+    "M1", "TP7", "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6",
+    "TP8", "M2",
+    "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8",
+    "PO7", "PO5", "PO3", "POz", "PO4", "PO6", "PO8",
+    "CB1", "O1", "Oz", "O2", "CB2",
 ]
 
-# TDBRAIN auxiliary ocular channels are used only by ICA.
-EOG_CHANNELS = ["VPVA", "VNVB", "HPHL", "HNHR"]
+HYDROCEL_128 = [f"E{i}" for i in range(1, 129)]
+HYDROCEL_129 = HYDROCEL_128 + ["Cz"]
+MONTAGE_NAME = "GSN-HydroCel-129"
 
-# Other non-EEG channels in the BDF.
-MISC_CHANNELS = ["Erbs", "Mass"]
-STIM_CHANNELS = ["Status"]
+# Fixed mapping from the PRED+CT COMMON_64 semantic positions to the MODMA
+# HydroCel-129 sensor layout.
+#
+# Most entries are manufacturer-published approximate 10-10 equivalents for
+# the 128-channel HydroCel GSN. The six positions not present in that table
+# (M1/M2/PO5/PO6/CB1/CB2) use fixed nearest-position matches derived from the
+# HydroCel-129 and PRED+CT electrode coordinates. Keeping this dictionary fixed
+# ensures every MODMA participant uses exactly the same channel mapping.
+COMMON64_TO_HYDROCEL = {
+    "Fp1": "E22",
+    "Fpz": "E14",
+    "Fp2": "E9",
+    "AF3": "E23",
+    "AF4": "E3",
 
+    "F7": "E33",
+    "F5": "E27",
+    "F3": "E24",
+    "F1": "E19",
+    "Fz": "E11",
+    "F2": "E4",
+    "F4": "E124",
+    "F6": "E123",
+    "F8": "E122",
 
-# =============================================================================
-# 3. LABEL-TABLE HELPERS
-# =============================================================================
+    "FT7": "E34",
+    "FC5": "E28",
+    "FC3": "E29",
+    "FC1": "E13",
+    "FCz": "E6",
+    "FC2": "E112",
+    "FC4": "E111",
+    "FC6": "E117",
+    "FT8": "E116",
 
-def read_table(path: Path) -> pd.DataFrame:
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        return pd.read_csv(path)
-    if suffix in {".tsv", ".txt"}:
-        return pd.read_csv(path, sep="\t")
-    if suffix in {".xlsx", ".xls"}:
-        return pd.read_excel(path)
-    raise ValueError(f"Unsupported label-table format: {path}")
+    "T7": "E45",
+    "C5": "E41",
+    "C3": "E36",
+    "C1": "E30",
+    "Cz": "Cz",
+    "C2": "E105",
+    "C4": "E104",
+    "C6": "E103",
+    "T8": "E108",
 
+    # Fixed nearest-position additions required by PRED+CT COMMON_64.
+    "M1": "E56",
 
-def discover_label_table(root: Path) -> Path:
-    """
-    Find a spreadsheet containing the columns required by TDBRAIN:
-      TDBRAIN_ID, sessID, formal_status.
-    """
-    required = {"TDBRAIN_ID", "sessID", "formal_status"}
+    "TP7": "E46",
+    "CP5": "E47",
+    "CP3": "E42",
+    "CP1": "E37",
+    "CPz": "E55",
+    "CP2": "E87",
+    "CP4": "E93",
+    "CP6": "E98",
+    "TP8": "E102",
 
-    candidate_dirs = [root, root.parent]
-    candidates: list[Path] = []
+    # Fixed nearest-position addition.
+    "M2": "E107",
 
-    for folder in candidate_dirs:
-        if not folder.exists():
-            continue
-        for pattern in ("*.csv", "*.tsv", "*.xlsx", "*.xls"):
-            candidates.extend(folder.glob(pattern))
+    "P7": "E58",
+    "P5": "E51",
+    "P3": "E52",
+    "P1": "E60",
+    "Pz": "E62",
+    "P2": "E85",
+    "P4": "E92",
+    "P6": "E97",
+    "P8": "E96",
 
-    for path in candidates:
-        try:
-            table = read_table(path)
-        except Exception:
-            continue
-        if required.issubset(table.columns):
-            return path
+    "PO7": "E65",
+    # Fixed nearest-position addition.
+    "PO5": "E66",
+    "PO3": "E67",
+    "POz": "E72",
+    "PO4": "E77",
+    # Fixed nearest-position addition.
+    "PO6": "E84",
+    "PO8": "E90",
 
-    raise FileNotFoundError(
-        "Could not automatically find the TDBRAIN label spreadsheet. "
-        "Set LABEL_TABLE_PATH to the full CSV/TSV/XLSX path."
+    # Fixed nearest-position additions for the PRED+CT cerebellar positions.
+    "CB1": "E69",
+    "O1": "E70",
+    "Oz": "E75",
+    "O2": "E83",
+    "CB2": "E89",
+}
+
+if list(COMMON64_TO_HYDROCEL.keys()) != COMMON_64:
+    raise RuntimeError(
+        "COMMON64_TO_HYDROCEL keys must exactly match COMMON_64 order."
     )
 
-
-def load_label_table(
-    label_table_path: Path | None,
-    dataset_root: Path,
-) -> tuple[pd.DataFrame, Path]:
-    if label_table_path is None:
-        label_table_path = discover_label_table(dataset_root)
-
-    path = Path(label_table_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Label table not found: {path}")
-
-    table = read_table(path).copy()
-
-    required = {"TDBRAIN_ID", "sessID", "formal_status"}
-    missing = required - set(table.columns)
-    if missing:
-        raise ValueError(
-            f"Label table is missing columns {sorted(missing)}. "
-            f"Available columns: {list(table.columns)}"
-        )
-
-    table["TDBRAIN_ID"] = table["TDBRAIN_ID"].astype(str).str.strip()
-    table["formal_status"] = (
-        table["formal_status"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
+if len(set(COMMON64_TO_HYDROCEL.values())) != len(COMMON_64):
+    raise RuntimeError(
+        "COMMON64_TO_HYDROCEL must be one-to-one; duplicate HydroCel sensors found."
     )
-    table["sessID"] = pd.to_numeric(
-        table["sessID"],
-        errors="coerce",
-    ).astype("Int64")
 
-    # The current downstream task is strictly MDD vs HEALTHY.
-    table = table[
-        table["formal_status"].isin(["MDD", "HEALTHY"])
-    ].copy()
+# MODMA is recorded online with Cz as the reference. When Cz is stored as a
+# zero-valued reference trace (or absent from a 128-row export), it must NOT be
+# treated as a bad/flat EEG channel before common-average re-referencing.
+ONLINE_REFERENCE_TARGET = "Cz"
 
-    if table.empty:
-        raise ValueError(
-            "The spreadsheet contains no MDD/HEALTHY rows in formal_status."
-        )
+# =============================================================================
+# 3. MAT LOADING
+# =============================================================================
 
-    return table, path
+def _get_struct_field(obj, name: str):
+    """Read one field from scipy-loaded MATLAB structs robustly."""
+    if hasattr(obj, name):
+        return getattr(obj, name)
+
+    if isinstance(obj, np.ndarray) and obj.dtype.names and name in obj.dtype.names:
+        value = obj[name]
+        while isinstance(value, np.ndarray) and value.size == 1:
+            value = value.item()
+        return value
+
+    if isinstance(obj, np.void) and obj.dtype.names and name in obj.dtype.names:
+        return obj[name]
+
+    raise KeyError(f"MATLAB EEG struct has no field '{name}'.")
 
 
-def build_label_lookup(
-    table: pd.DataFrame,
-) -> dict[tuple[str, int], str]:
-    lookup: dict[tuple[str, int], str] = {}
+def _extract_chanloc_labels(chanlocs) -> list[str]:
+    """Best-effort extraction of EEGLAB chanlocs.labels."""
+    labels: list[str] = []
 
-    for row in table.itertuples(index=False):
-        if pd.isna(row.sessID):
+    if chanlocs is None:
+        return labels
+
+    arr = np.atleast_1d(chanlocs).ravel()
+
+    for item in arr:
+        value = None
+
+        if hasattr(item, "labels"):
+            value = getattr(item, "labels")
+        elif isinstance(item, np.void) and item.dtype.names and "labels" in item.dtype.names:
+            value = item["labels"]
+
+        if value is None:
             continue
 
-        key = (str(row.TDBRAIN_ID), int(row.sessID))
-        diagnosis = str(row.formal_status)
+        while isinstance(value, np.ndarray) and value.size == 1:
+            value = value.item()
 
-        previous = lookup.get(key)
-        if previous is not None and previous != diagnosis:
-            raise ValueError(
-                f"Conflicting formal_status labels for {key}: "
-                f"{previous} vs {diagnosis}"
+        labels.append(str(value).strip())
+
+    return labels
+
+
+def load_modma_mat(
+    mat_path: Path,
+) -> tuple[np.ndarray, float, list[str], dict]:
+    """
+    Load one original MODMA resting-state MAT file.
+
+    Returns
+    -------
+    data_129
+        Shape (129, T): E1-E128 plus Cz reference.
+        If an export contains only 128 rows, a zero Cz reference trace is
+        appended because MODMA was acquired online referenced to Cz.
+    sfreq
+        Sampling frequency.
+    source_channel_names
+        E1 ... E128, Cz.
+    mat_info
+        Validation metadata from the MAT structure.
+    """
+    mat_path = Path(mat_path)
+
+    if not mat_path.exists():
+        raise FileNotFoundError(
+            f"MAT file not found: {mat_path}"
+        )
+
+    try:
+        mat = loadmat(
+            mat_path,
+            squeeze_me=True,
+            struct_as_record=False,
+        )
+    except NotImplementedError as exc:
+        raise RuntimeError(
+            f"{mat_path.name} appears to be MATLAB v7.3/HDF5. "
+            "This script expects a MAT structure readable by scipy.io.loadmat."
+        ) from exc
+
+    if "EEG" not in mat:
+        visible_keys = [
+            key
+            for key in mat.keys()
+            if not key.startswith("__")
+        ]
+        raise KeyError(
+            f"{mat_path.name}: expected MATLAB variable 'EEG', "
+            f"found {visible_keys}"
+        )
+
+    eeg = mat["EEG"]
+
+    data = np.asarray(
+        _get_struct_field(
+            eeg,
+            "data",
+        )
+    ).squeeze()
+
+    if data.ndim != 2:
+        raise ValueError(
+            f"{mat_path.name}: EEG.data must be 2-D, "
+            f"got shape {data.shape}"
+        )
+
+    if data.shape[0] in (128, 129):
+        channel_first = data
+    elif data.shape[1] in (128, 129):
+        channel_first = data.T
+    else:
+        raise ValueError(
+            f"{mat_path.name}: cannot identify 128/129 channels from "
+            f"EEG.data shape {data.shape}"
+        )
+
+    n_stored_channels = int(
+        channel_first.shape[0]
+    )
+
+    data_128 = np.asarray(
+        channel_first[:128],
+        dtype=np.float64,
+    )
+
+    if n_stored_channels == 129:
+        cz_data = np.asarray(
+            channel_first[128:129],
+            dtype=np.float64,
+        )
+        cz_source = "stored_129th_channel"
+    else:
+        # Because the acquisition reference is Cz, a zero reference trace can
+        # be appended before average rereferencing if a 128-row export omitted
+        # the reference channel.
+        cz_data = np.zeros(
+            (1, data_128.shape[1]),
+            dtype=np.float64,
+        )
+        cz_source = "zero_reference_reconstructed"
+
+    data_129 = np.concatenate(
+        [
+            data_128,
+            cz_data,
+        ],
+        axis=0,
+    )
+
+    try:
+        sfreq = float(
+            np.asarray(
+                _get_struct_field(
+                    eeg,
+                    "srate",
+                )
+            ).squeeze()
+        )
+    except Exception:
+        sfreq = 250.0
+
+    if (
+        not np.isfinite(sfreq)
+        or sfreq <= 0
+    ):
+        raise ValueError(
+            f"{mat_path.name}: invalid EEG.srate={sfreq}"
+        )
+
+    chanloc_labels = []
+
+    try:
+        chanlocs = _get_struct_field(
+            eeg,
+            "chanlocs",
+        )
+        chanloc_labels = (
+            _extract_chanloc_labels(
+                chanlocs
             )
-        lookup[key] = diagnosis
-
-    return lookup
-
-
-# =============================================================================
-# 4. TDBRAIN FILE / CHANNEL HELPERS
-# =============================================================================
-
-def parse_subject_and_session_from_filename(
-    path: Path,
-) -> tuple[str | None, str | None]:
-    match = re.search(
-        r"(sub-\d+)_(ses-\d+)_task-restEC_eeg",
-        path.name,
-    )
-    if match:
-        return match.group(1), match.group(2)
-    return None, None
-
-
-def parse_subject_and_session(
-    path: Path,
-    raw: mne.io.BaseRaw | None = None,
-) -> tuple[str, str]:
-    """
-    Normal dataset files are parsed from their BIDS filename.
-
-    The Raw-header fallback is useful for validating uploaded BDF examples
-    whose original filename may have been replaced by an opaque upload ID.
-    """
-    subject_id, session_id = parse_subject_and_session_from_filename(path)
-    if subject_id is not None and session_id is not None:
-        return subject_id, session_id
-
-    if raw is None:
-        raw = mne.io.read_raw_bdf(
-            path,
-            preload=False,
-            verbose="ERROR",
         )
+    except Exception:
+        pass
 
-    subject_info = raw.info.get("subject_info") or {}
-    his_id = subject_info.get("his_id")
+    if len(chanloc_labels) >= 128:
+        first_128 = chanloc_labels[:128]
 
-    if his_id is None:
-        raise ValueError(
-            f"Cannot infer TDBRAIN subject ID from filename or BDF header: {path}"
+        channel_labels_match = (
+            [
+                str(x).upper()
+                for x in first_128
+            ]
+            == [
+                str(x).upper()
+                for x in HYDROCEL_128
+            ]
         )
+    else:
+        channel_labels_match = None
 
-    text = str(his_id).strip()
-    if not text.startswith("sub-"):
-        text = f"sub-{text}"
-
-    # Uploaded examples can lose the BIDS filename. TDBRAIN files in the
-    # user's actual dataset retain ses-* in their filenames, so ses-1 here is
-    # only a conservative validation fallback.
-    return text, "ses-1"
-
-
-def normalize_aux_channel_names(raw: mne.io.BaseRaw) -> None:
-    canonical = {
-        "ERBS": "Erbs",
-        "MASS": "Mass",
-        "STATUS": "Status",
+    mat_info = {
+        "mat_variable": "EEG",
+        "original_eeg_data_shape": list(
+            channel_first.shape
+        ),
+        "stored_channel_count": n_stored_channels,
+        "source_layout": "E1-E128 + Cz reference",
+        "cz_reference_source": cz_source,
+        "mat_sfreq": sfreq,
+        "chanloc_labels_found": len(
+            chanloc_labels
+        ),
+        "first_128_chanlocs_match_E1_E128": (
+            channel_labels_match
+        ),
+        "final_channel_count": 64,
+        "final_channel_order": COMMON_64,
+        "common64_to_hydrocel": (
+            COMMON64_TO_HYDROCEL
+        ),
     }
 
-    rename = {}
-    for ch in raw.ch_names:
-        upper = str(ch).upper()
-        if upper in canonical and ch != canonical[upper]:
-            rename[ch] = canonical[upper]
-
-    if rename:
-        raw.rename_channels(rename)
+    return (
+        data_129,
+        sfreq,
+        HYDROCEL_129.copy(),
+        mat_info,
+    )
 
 
-def validate_and_prepare_channel_types(
-    raw: mne.io.BaseRaw,
-) -> mne.io.BaseRaw:
-    normalize_aux_channel_names(raw)
+def convert_input_to_volts(
+    data: np.ndarray,
+) -> np.ndarray:
+    """Convert MAT numeric samples to volts for MNE processing."""
+    unit = MAT_INPUT_UNIT.strip().lower()
 
-    missing = [ch for ch in EEG_26 if ch not in raw.ch_names]
-    if missing:
-        raise ValueError(
-            f"Missing required TDBRAIN EEG channels: {missing}"
+    if unit in {
+        "uv",
+        "µv",
+        "μv",
+        "microvolt",
+        "microvolts",
+    }:
+        return (
+            np.asarray(
+                data,
+                dtype=np.float64,
+            )
+            * 1e-6
         )
 
-    type_map = {ch: "eeg" for ch in EEG_26}
+    if unit in {
+        "v",
+        "volt",
+        "volts",
+    }:
+        return np.asarray(
+            data,
+            dtype=np.float64,
+        )
 
-    for ch in EOG_CHANNELS:
-        if ch in raw.ch_names:
-            type_map[ch] = "eog"
+    raise ValueError(
+        f"Unsupported MAT_INPUT_UNIT={MAT_INPUT_UNIT!r}; "
+        "use 'uV' or 'V'."
+    )
 
-    for ch in MISC_CHANNELS:
-        if ch in raw.ch_names:
-            type_map[ch] = "misc"
 
-    for ch in STIM_CHANNELS:
-        if ch in raw.ch_names:
-            type_map[ch] = "stim"
+def make_raw_from_mat(
+    data_129: np.ndarray,
+    sfreq: float,
+) -> mne.io.RawArray:
+    """
+    Select and rename the MODMA HydroCel sensors to PRED+CT COMMON_64.
 
-    raw.set_channel_types(
-        type_map,
+    The selected data are still in the original Cz-referenced potential
+    representation at this stage. Common-average re-referencing occurs later.
+    """
+    if data_129.shape[0] != len(
+        HYDROCEL_129
+    ):
+        raise ValueError(
+            f"Expected 129 source channels, got {data_129.shape}"
+        )
+
+    source_index = {
+        name: i
+        for i, name in enumerate(
+            HYDROCEL_129
+        )
+    }
+
+    selected_source_names = [
+        COMMON64_TO_HYDROCEL[
+            target
+        ]
+        for target in COMMON_64
+    ]
+
+    selected_indices = [
+        source_index[
+            source
+        ]
+        for source in selected_source_names
+    ]
+
+    selected_data = np.asarray(
+        data_129[
+            selected_indices,
+            :
+        ],
+        dtype=np.float64,
+    )
+
+    data_v = convert_input_to_volts(
+        selected_data
+    )
+
+    info = mne.create_info(
+        ch_names=COMMON_64,
+        sfreq=float(
+            sfreq
+        ),
+        ch_types=[
+            "eeg"
+        ] * len(
+            COMMON_64
+        ),
+    )
+
+    raw = mne.io.RawArray(
+        data_v,
+        info,
         verbose="ERROR",
     )
 
-    # All 26 retained EEG channels exist in the standard 10-20 montage.
-    montage = mne.channels.make_standard_montage("standard_1020")
+    # Use the actual HydroCel coordinates of the selected source sensors while
+    # exposing the harmonized PRED+CT semantic channel names to downstream code.
+    hydrocel_montage = (
+        mne.channels.make_standard_montage(
+            MONTAGE_NAME
+        )
+    )
+
+    hydrocel_positions = (
+        hydrocel_montage
+        .get_positions()[
+            "ch_pos"
+        ]
+    )
+
+    common_positions = {
+        target: np.asarray(
+            hydrocel_positions[
+                COMMON64_TO_HYDROCEL[
+                    target
+                ]
+            ],
+            dtype=float,
+        )
+        for target in COMMON_64
+    }
+
+    common_montage = (
+        mne.channels.make_dig_montage(
+            ch_pos=common_positions,
+            coord_frame="head",
+        )
+    )
+
     raw.set_montage(
-        montage,
-        on_missing="ignore",
+        common_montage,
+        on_missing="raise",
         verbose="ERROR",
     )
 
     return raw
 
 
-def get_eeg_positions(
-    raw: mne.io.BaseRaw,
-) -> dict[str, np.ndarray]:
-    montage = raw.get_montage()
-    if montage is None:
-        raise RuntimeError(
-            "No montage is available for nearest-electrode interpolation."
-        )
+# =============================================================================
+# 4. FILE / LABEL HELPERS
+# =============================================================================
 
-    montage_positions = montage.get_positions()["ch_pos"]
-    positions: dict[str, np.ndarray] = {}
+def parse_modma_subject_id(path: Path) -> str:
+    """Use the original numeric filename as the subject identifier."""
+    return Path(path).stem
 
-    for ch in EEG_26:
-        if ch not in montage_positions:
-            continue
-        xyz = np.asarray(
-            montage_positions[ch],
-            dtype=float,
-        )
-        if np.all(np.isfinite(xyz)):
-            positions[ch] = xyz
 
-    missing = [ch for ch in EEG_26 if ch not in positions]
-    if missing:
-        raise RuntimeError(
-            f"Missing standard coordinates for TDBRAIN channels: {missing}"
-        )
+def diagnosis_from_filename(path: Path) -> tuple[str, int]:
+    """
+    Official MODMA original filename convention:
+      0201... -> MDD
+      0203... -> HEALTHY
+    """
+    name = Path(path).stem
 
-    return positions
+    if name.startswith("0201"):
+        return "MDD", 1
+
+    if name.startswith("0203"):
+        return "HEALTHY", 0
+
+    raise ValueError(
+        f"{path.name}: cannot infer diagnosis from filename. "
+        "Expected prefix 0201 (MDD) or 0203 (HEALTHY)."
+    )
 
 
 # =============================================================================
-# 5. PREPROCESSING HELPERS -- MATCHED TO PRED+CT
+# 5. BAD-CHANNEL DETECTION + INTERPOLATION
 # =============================================================================
 
 def detect_bad_eeg_channels(
     raw: mne.io.BaseRaw,
 ) -> tuple[list[str], dict[str, float]]:
     """
-    Same method as the supplied PRED+CT script:
-      robust z-score of log10(channel SD)
-      first 30 seconds
-      flat channel OR abs(z) > 6
+    Robust-z bad-channel detection matched to the PRED+CT/TDBRAIN pipeline.
+
+    Uses log10(channel SD) from the first <=30 s.
     """
-    eeg = raw.copy().pick(EEG_26)
+    eeg = raw.copy().pick(COMMON_64)
 
     if eeg.times[-1] > 30.0:
         eeg.crop(
@@ -438,7 +739,11 @@ def detect_bad_eeg_channels(
 
     data = eeg.get_data()
 
-    channel_std = np.std(data, axis=1)
+    channel_std = np.std(
+        data,
+        axis=1,
+    )
+
     log_std = np.log10(
         channel_std + np.finfo(float).eps
     )
@@ -458,11 +763,22 @@ def detect_bad_eeg_channels(
         )
 
     flat = channel_std < 1e-12
+
     bad_mask = (
         flat
         | ~np.isfinite(channel_std)
         | (np.abs(robust_z) > BAD_Z_THRESHOLD)
     )
+
+    # Cz is the online reference in MODMA and may be stored as an all-zero
+    # reference trace before CAR. Do not classify that expected reference trace
+    # as a bad channel. After CAR it becomes a valid average-referenced signal.
+    if ONLINE_REFERENCE_TARGET in eeg.ch_names:
+        cz_idx = eeg.ch_names.index(
+            ONLINE_REFERENCE_TARGET
+        )
+        bad_mask[cz_idx] = False
+        robust_z[cz_idx] = 0.0
 
     bads = [
         eeg.ch_names[i]
@@ -477,37 +793,73 @@ def detect_bad_eeg_channels(
     return bads, z_scores
 
 
+def get_eeg_positions(
+    raw: mne.io.BaseRaw,
+) -> dict[str, np.ndarray]:
+    montage = raw.get_montage()
+
+    if montage is None:
+        raise RuntimeError(
+            "No HydroCel montage is available for interpolation."
+        )
+
+    montage_positions = montage.get_positions()["ch_pos"]
+
+    positions = {}
+
+    for ch in COMMON_64:
+        if ch not in montage_positions:
+            continue
+
+        xyz = np.asarray(
+            montage_positions[ch],
+            dtype=float,
+        )
+
+        if np.all(np.isfinite(xyz)):
+            positions[ch] = xyz
+
+    missing = [
+        ch for ch in COMMON_64
+        if ch not in positions
+    ]
+
+    if missing:
+        raise RuntimeError(
+            f"Missing selected-channel coordinates for channels: {missing}"
+        )
+
+    return positions
+
+
 def interpolate_nearest_electrodes(
     raw: mne.io.BaseRaw,
     bad_channels: list[str],
     positions: dict[str, np.ndarray],
     k: int = NEIGHBOR_COUNT,
 ) -> tuple[mne.io.BaseRaw, dict[str, list[str]]]:
-    """
-    Same simple interpolation strategy as the PRED+CT script:
-    inverse-distance weighted average of k nearest good electrodes.
-    """
+    """Inverse-distance interpolation from k nearest good HydroCel electrodes."""
     if not bad_channels:
         return raw, {}
 
-    interpolation_log: dict[str, list[str]] = {}
+    interpolation_log = {}
+
     good_channels = [
-        ch for ch in EEG_26
+        ch for ch in COMMON_64
         if ch not in bad_channels
     ]
 
     for bad in bad_channels:
-        if bad not in raw.ch_names:
-            continue
-
         candidates = []
 
         for good in good_channels:
             distance = float(
                 np.linalg.norm(
-                    positions[good] - positions[bad]
+                    positions[good]
+                    - positions[bad]
                 )
             )
+
             if np.isfinite(distance) and distance > 0:
                 candidates.append(
                     (good, distance)
@@ -516,17 +868,19 @@ def interpolate_nearest_electrodes(
         candidates.sort(
             key=lambda item: item[1]
         )
+
         selected = candidates[:k]
 
         if len(selected) < k:
             raise RuntimeError(
                 f"Cannot interpolate {bad}: only "
-                f"{len(selected)} valid neighbouring electrodes."
+                f"{len(selected)} valid neighbours."
             )
 
         neighbours = [
             name for name, _ in selected
         ]
+
         distances = np.asarray(
             [distance for _, distance in selected],
             dtype=float,
@@ -536,21 +890,18 @@ def interpolate_nearest_electrodes(
             distances,
             1e-12,
         )
+
         weights /= weights.sum()
 
         bad_idx = raw.ch_names.index(bad)
+
         neighbour_idx = [
             raw.ch_names.index(ch)
             for ch in neighbours
         ]
 
-        neighbour_data = raw._data[
-            neighbour_idx,
-            :
-        ]
-
         raw._data[bad_idx, :] = np.average(
-            neighbour_data,
+            raw._data[neighbour_idx, :],
             axis=0,
             weights=weights,
         )
@@ -560,22 +911,30 @@ def interpolate_nearest_electrodes(
     return raw, interpolation_log
 
 
+# =============================================================================
+# 6. ICA
+# =============================================================================
+
 def run_ica_ocular_removal(
     raw: mne.io.BaseRaw,
-) -> tuple[mne.io.BaseRaw, list[int], bool]:
+) -> tuple[mne.io.BaseRaw, list[int], bool, list[str]]:
     """
-    Adapted directly from PRED+CT ICA logic.
+    Conservative FastICA ocular removal using frontal EEG proxy channels.
 
-    TDBRAIN uses VPVA/VNVB/HPHL/HNHR as EOG reference channels.
-    Fit on the first <=30 s and remove at most two ocular components.
+    MODMA's published resting MAT layout does not provide dedicated EOG
+    channels, so E25/E14/E8 are used only to score components. At most two
+    components are removed.
     """
-    eog_channels = [
-        ch for ch in EOG_CHANNELS
+    if not USE_FRONTAL_PROXY_ICA:
+        return raw, [], True, []
+
+    proxy_channels = [
+        ch for ch in ICA_FRONTAL_PROXY_CHANNELS
         if ch in raw.ch_names
     ]
 
-    if not eog_channels:
-        return raw, [], True
+    if not proxy_channels:
+        return raw, [], True, []
 
     fit_raw = raw.copy()
 
@@ -588,11 +947,8 @@ def run_ica_ocular_removal(
 
     n_components = min(
         ICA_MAX_COMPONENTS,
-        len(EEG_26) - 1,
+        len(COMMON_64) - 1,
     )
-
-    if n_components < 2:
-        return raw, [], True
 
     ica = ICA(
         n_components=n_components,
@@ -625,15 +981,15 @@ def run_ica_ocular_removal(
             converged = False
 
     if not converged:
-        return raw, [], False
+        return raw, [], False, proxy_channels
 
     candidate_scores: dict[int, float] = {}
 
-    for eog_name in eog_channels:
+    for proxy_name in proxy_channels:
         try:
             inds, scores = ica.find_bads_eog(
                 fit_raw,
-                ch_name=eog_name,
+                ch_name=proxy_name,
                 threshold=ICA_EOG_THRESHOLD,
                 verbose="ERROR",
             )
@@ -647,17 +1003,13 @@ def run_ica_ocular_removal(
                     if idx < len(scores)
                     else 0.0
                 )
+
                 candidate_scores[idx] = max(
-                    candidate_scores.get(
-                        idx,
-                        0.0,
-                    ),
+                    candidate_scores.get(idx, 0.0),
                     score,
                 )
 
         except Exception:
-            # Same principle as PRED+CT:
-            # one problematic EOG channel should not abort a recording.
             continue
 
     # ranked = sorted(
@@ -684,16 +1036,17 @@ def run_ica_ocular_removal(
 
     if exclude:
         ica.exclude = exclude
+
         raw = ica.apply(
             raw.copy(),
             verbose="ERROR",
         )
 
-    return raw, exclude, True
+    return raw, exclude, True, proxy_channels
 
 
 # =============================================================================
-# 6. WINDOWING + FUNCTIONAL CONNECTIVITY
+# 7. WINDOWING + FC
 # =============================================================================
 
 def make_one_second_ec_windows(
@@ -709,16 +1062,12 @@ def make_one_second_ec_windows(
     np.ndarray,
 ]:
     """
-    TDBRAIN task-restEC BDF is already one Eyes Closed recording.
+    The full MODMA resting recording is eyes-closed.
 
-    We therefore treat the full usable file as one EC block and retain only
-    complete non-overlapping 1-s windows. The final <1-s remainder, if any,
-    is discarded.
-
-    Return structure intentionally mirrors the PRED+CT event-aware function.
+    Keep only complete, non-overlapping 1-s windows.
     """
-    eeg = raw.copy().pick(EEG_26)
-    eeg.reorder_channels(EEG_26)
+    eeg = raw.copy().pick(COMMON_64)
+    eeg.reorder_channels(COMMON_64)
 
     sfreq = float(
         eeg.info["sfreq"]
@@ -756,7 +1105,7 @@ def make_one_second_ec_windows(
     )
 
     data = continuous.reshape(
-        len(EEG_26),
+        len(COMMON_64),
         n_windows,
         samples_per_window,
     ).transpose(
@@ -774,8 +1123,11 @@ def make_one_second_ec_windows(
             )
         )
 
-    # MNE data are in volts. Export final windows in microvolts.
-    data = data * OUTPUT_EEG_SCALE
+    # MNE internal unit is V. Export uV.
+    data = (
+        data
+        * OUTPUT_EEG_SCALE
+    )
 
     data = np.asarray(
         data,
@@ -800,7 +1152,6 @@ def make_one_second_ec_windows(
         dtype=np.str_,
     )
 
-    # PRED+CT-compatible placeholder event metadata.
     event_codes = np.zeros(
         n_windows,
         dtype=np.int16,
@@ -1131,18 +1482,14 @@ def compute_pearson_fc(
     windows: np.ndarray,
 ) -> np.ndarray:
     """
-    Copied conceptually from the supplied PRED+CT script.
+    Pearson FC per 1-s EEG window.
 
-    windows : (N, C, T)
-    fc      : (N, C, C)
-
-    Pearson r in [-1, 1], diagonal explicitly set to 0.
-    Undefined zero-variance correlations are safely replaced with 0.
+    windows : (N, 64, 250)
+    fc      : (N, 64, 64)
     """
     if windows.ndim != 3:
         raise ValueError(
-            f"Expected windows with shape (N, C, T), "
-            f"got {windows.shape}"
+            f"Expected (N,C,T), got {windows.shape}"
         )
 
     x = np.asarray(
@@ -1179,13 +1526,10 @@ def compute_pearson_fc(
         * norms[:, None, :]
     )
 
-    # Do not use float32.eps as an absolute zero threshold.
-    # A channel is invalid only when its norm is effectively zero.
+    # float32.eps is NOT an absolute zero threshold.
     valid_channel = (
         norms
-        > np.finfo(
-            np.float32
-        ).tiny
+        > np.finfo(np.float32).tiny
     )
 
     valid_pair = (
@@ -1229,7 +1573,6 @@ def compute_pearson_fc(
         diag,
     ] = 0.0
 
-    # Prevent silent generation of broken all-zero FC batches.
     zero_fraction = float(
         np.mean(
             np.all(
@@ -1249,7 +1592,7 @@ def compute_pearson_fc(
 
 
 # =============================================================================
-# 7. SAVE -- PRED+CT-COMPATIBLE STRUCTURE + DIAGNOSIS
+# 8. SAVE
 # =============================================================================
 
 def save_npz(
@@ -1264,32 +1607,32 @@ def save_npz(
     event_block_starts: np.ndarray,
     event_block_ends: np.ndarray,
     subject_id: str,
-    session_id: str,
     diagnosis: str,
+    diagnosis_id: int,
     source_file: str,
+    original_sfreq: float,
+    mat_info: dict,
     bad_channels: list[str],
     interpolation_log: dict[str, list[str]],
     ica_excluded: list[int],
     ica_converged: bool,
-    label_table_path: Path,
+    ica_proxy_channels: list[str],
     window_qc: dict,
 ) -> None:
-    n_windows = data.shape[0]
+    n_windows = int(
+        data.shape[0]
+    )
 
-    if fc.shape != (
+    expected_fc_shape = (
         data.shape[0],
         data.shape[1],
         data.shape[1],
-    ):
-        raise ValueError(
-            f"FC shape {fc.shape} does not match "
-            f"EEG data shape {data.shape}."
-        )
-
-    diagnosis_id = (
-        1 if diagnosis == "MDD"
-        else 0
     )
+
+    if fc.shape != expected_fc_shape:
+        raise ValueError(
+            f"FC shape {fc.shape} != expected {expected_fc_shape}"
+        )
 
     diagnosis_labels = np.asarray(
         [diagnosis] * n_windows,
@@ -1306,45 +1649,50 @@ def save_npz(
         "dataset_name": DATASET_NAME,
         "source_file": source_file,
         "subject_id": subject_id,
-        "session_id": session_id,
-        "shape": list(data.shape),
-        "fc_shape": list(fc.shape),
-        "data_unit": OUTPUT_EEG_UNIT,
-        "data_scale_from_mne_volts": OUTPUT_EEG_SCALE,
-        "functional_connectivity": (
-            "Pearson correlation computed independently "
-            "for each 1-s EEG window"
-        ),
-        "fc_range": [-1.0, 1.0],
-        "fc_diagonal": 0.0,
-        "target_sfreq": TARGET_SFREQ,
-        "window_seconds": WINDOW_SECONDS,
-        "windowing": (
-            "full task-restEC recording; complete "
-            "non-overlapping 1-s windows only"
-        ),
-        "physiological_state": "Eyes Closed",
         "diagnosis": diagnosis,
         "diagnosis_id": diagnosis_id,
         "diagnosis_mapping": {
             "HEALTHY": 0,
             "MDD": 1,
         },
-        "label_source_file": str(
-            label_table_path
+        "diagnosis_source": (
+            "official original MODMA filename prefix: "
+            "0201=MDD, 0203=HEALTHY"
         ),
-        "label_source_columns": [
-            "TDBRAIN_ID",
-            "sessID",
-            "formal_status",
-        ],
+        "physiological_state": "Eyes Closed",
+        "shape": list(data.shape),
+        "fc_shape": list(fc.shape),
+        "channel_order": COMMON_64,
+        "channel_mapping_source": (
+            "HydroCel manufacturer 10-10 equivalence where available; "
+            "fixed nearest-position mapping for M1/M2/PO5/PO6/CB1/CB2"
+        ),
+        "common64_to_hydrocel": COMMON64_TO_HYDROCEL,
+        "online_reference": "Cz",
+        "cz_reference_retained_for_CAR": True,
+        "mat_info": mat_info,
+        "mat_input_unit": MAT_INPUT_UNIT,
+        "data_unit": OUTPUT_EEG_UNIT,
+        "data_scale_from_mne_volts": OUTPUT_EEG_SCALE,
+        "original_sfreq": original_sfreq,
+        "target_sfreq": TARGET_SFREQ,
+        "window_seconds": WINDOW_SECONDS,
+        "windowing": (
+            "full eyes-closed resting recording; "
+            "complete non-overlapping 1-s windows only"
+        ),
+        "functional_connectivity": (
+            "Pearson correlation computed independently "
+            "for each 1-s EEG window"
+        ),
+        "fc_range": [-1.0, 1.0],
+        "fc_diagonal": 0.0,
         "bandpass_hz": [
             BANDPASS_LOW,
             BANDPASS_HIGH,
         ],
         "filter": (
-            f"{FILTER_ORDER}th-order "
-            "Butterworth IIR"
+            f"{FILTER_ORDER}th-order Butterworth IIR"
         ),
         "notch_hz": DEFAULT_LINE_FREQ,
         "bad_channel_method": (
@@ -1356,23 +1704,18 @@ def save_npz(
             f"{NEIGHBOR_COUNT}-nearest-electrode "
             "inverse-distance weighted average"
         ),
-        "interpolation_neighbours": (
-            interpolation_log
+        "interpolation_neighbours": interpolation_log,
+        "montage": MONTAGE_NAME,
+        "reference": "common average reference",
+        "ica_method": (
+            "FastICA with frontal EEG proxy scoring"
+            if USE_FRONTAL_PROXY_ICA
+            else "disabled"
         ),
-        "reference": (
-            "common average reference"
-        ),
-        "ica_method": "FastICA",
-        "ica_max_components": (
-            ICA_MAX_COMPONENTS
-        ),
-        "ica_max_ocular_components_removed": (
-            ICA_MAX_OCULAR_COMPONENTS
-        ),
-        "ica_eog_channels": EOG_CHANNELS,
-        "ica_excluded_components": (
-            ica_excluded
-        ),
+        "ica_proxy_channels": ica_proxy_channels,
+        "ica_max_components": ICA_MAX_COMPONENTS,
+        "ica_max_ocular_components_removed": ICA_MAX_OCULAR_COMPONENTS,
+        "ica_excluded_components": ica_excluded,
         "ica_converged": bool(
             ica_converged
         ),
@@ -1384,13 +1727,13 @@ def save_npz(
         "window_qc": window_qc,
     }
 
-    np.savez(
+    np.savez_compressed(
         output_path,
-
-        # Identical core arrays to PRED+CT.
         data=data,
         fc=fc,
         labels=labels,
+        diagnosis_labels=diagnosis_labels,
+        diagnosis_ids=diagnosis_ids,
         event_codes=event_codes,
         event_block_ids=event_block_ids,
         event_block_start_sec=event_block_starts,
@@ -1404,24 +1747,16 @@ def save_npz(
             [subject_id] * n_windows,
             dtype=np.str_,
         ),
-
-        # PRED+CT has run_ids; TDBRAIN uses session instead.
-        # run_ids is retained for loader compatibility.
         run_ids=np.asarray(
-            [session_id] * n_windows,
+            ["restEC"] * n_windows,
             dtype=np.str_,
         ),
-        session_ids=np.asarray(
-            [session_id] * n_windows,
-            dtype=np.str_,
-        ),
-
         dataset_names=np.asarray(
             [DATASET_NAME] * n_windows,
             dtype=np.str_,
         ),
         channel_names=np.asarray(
-            EEG_26,
+            COMMON_64,
             dtype=np.str_,
         ),
         sfreq=np.asarray(
@@ -1443,19 +1778,12 @@ def save_npz(
             ),
             dtype=np.str_,
         ),
-
-        # TDBRAIN-specific supervised target.
-        diagnosis_labels=diagnosis_labels,
-        diagnosis_ids=diagnosis_ids,
     )
 
 
 def count_existing_npz_windows(
     path: Path,
 ) -> int:
-    """
-    Same resume helper used by PRED+CT.
-    """
     if not path.exists():
         return 0
 
@@ -1464,27 +1792,22 @@ def count_existing_npz_windows(
             path,
             allow_pickle=False,
         ) as npz:
-            if "data" in npz:
-                return int(
-                    npz["data"].shape[0]
-                )
+            return int(
+                npz["data"].shape[0]
+            )
     except Exception:
-        pass
-
-    return 0
+        return 0
 
 
 # =============================================================================
-# 8. PROCESS ONE TDBRAIN RECORDING
+# 9. PROCESS ONE RECORDING
 # =============================================================================
 
 def process_one_recording(
-    bdf_path: Path,
+    mat_path: Path,
     output_dir: Path,
-    label_lookup: dict[tuple[str, int], str],
-    label_table_path: Path,
 ) -> dict:
-    bdf_path = Path(bdf_path)
+    mat_path = Path(mat_path)
     output_dir = Path(output_dir)
 
     output_dir.mkdir(
@@ -1492,94 +1815,75 @@ def process_one_recording(
         exist_ok=True,
     )
 
-    # Read BDF first; this also enables the validation fallback when an
-    # uploaded file has lost its original BIDS filename.
-    raw = mne.io.read_raw_bdf(
-        bdf_path,
-        preload=True,
-        verbose="ERROR",
+    subject_id = parse_modma_subject_id(
+        mat_path
     )
 
-    original_sfreq = float(
-        raw.info["sfreq"]
+    diagnosis, diagnosis_id = diagnosis_from_filename(
+        mat_path
     )
-
-    subject_id, session_id = (
-        parse_subject_and_session(
-            bdf_path,
-            raw=raw,
-        )
-    )
-
-    session_match = re.fullmatch(
-        r"ses-(\d+)",
-        session_id,
-    )
-
-    if not session_match:
-        raise ValueError(
-            f"Unexpected TDBRAIN session: {session_id}"
-        )
-
-    session_number = int(
-        session_match.group(1)
-    )
-
-    diagnosis = label_lookup.get(
-        (
-            subject_id,
-            session_number,
-        )
-    )
-
-    if diagnosis not in {
-        "MDD",
-        "HEALTHY",
-    }:
-        raise KeyError(
-            "No MDD/HEALTHY formal_status found for "
-            f"{subject_id} {session_id}"
-        )
 
     output_path = (
         output_dir
-        / (
-            f"{subject_id}_{session_id}"
-            "_task-restEC_eeg_EC.npz"
-        )
+        / f"{subject_id}_EC.npz"
     )
 
     if (
         output_path.exists()
         and not OVERWRITE
     ):
-        count = count_existing_npz_windows(
+        n_windows = count_existing_npz_windows(
             output_path
         )
 
         return {
             "subject_id": subject_id,
-            "session_id": session_id,
             "diagnosis": diagnosis,
-            "source_file": bdf_path.name,
+            "source_file": mat_path.name,
             "output_file": output_path.name,
             "status": "SKIPPED_EXISTS",
-            "n_windows": count,
-            "n_channels": len(EEG_26),
-            "samples_per_window": int(
-                round(
-                    WINDOW_SECONDS
-                    * TARGET_SFREQ
-                )
-            ),
-            "fc_shape_per_window": "26x26",
+            "n_windows": n_windows,
+            "n_channels": 64,
+            "samples_per_window": 250,
+            "fc_shape_per_window": "64x64",
         }
 
-    raw = validate_and_prepare_channel_types(
-        raw
+    (
+        mat_data,
+        original_sfreq,
+        channel_names,
+        mat_info,
+    ) = load_modma_mat(
+        mat_path
     )
 
-    # Same numerical-safety step as PRED+CT.
+    raw = make_raw_from_mat(
+        mat_data,
+        original_sfreq,
+    )
+
+    # Basic amplitude sanity check in the original MAT numeric unit.
+    original_channel_std = np.std(
+        mat_data[:128],
+        axis=1,
+    )
+
+    median_input_std = float(
+        np.median(
+            original_channel_std[
+                np.isfinite(original_channel_std)
+            ]
+        )
+    )
+
+    # Do not silently continue with obviously inconsistent unit settings.
+    if MAT_INPUT_UNIT.lower() == "uv" and median_input_std < 1e-3:
+        warnings.warn(
+            f"{mat_path.name}: median raw channel SD={median_input_std:.3e} "
+            "is extremely small for data declared as uV. Verify MAT_INPUT_UNIT.",
+            RuntimeWarning,
+        )
+
     raw._data[
         ~np.isfinite(raw._data)
     ] = 0.0
@@ -1609,7 +1913,7 @@ def process_one_recording(
         verbose="ERROR",
     )
 
-    # 3) Resample to 250 Hz.
+    # 3) Resample if required.
     if not np.isclose(
         raw.info["sfreq"],
         TARGET_SFREQ,
@@ -1619,14 +1923,14 @@ def process_one_recording(
             verbose="ERROR",
         )
 
-    # 4) Same robust-z bad-channel detection as PRED+CT.
+    # 4) Bad-channel detection.
     bad_channels, bad_z_scores = (
         detect_bad_eeg_channels(
             raw
         )
     )
 
-    # 5) Same simple nearest-electrode interpolation.
+    # 5) Nearest-electrode interpolation.
     positions = get_eeg_positions(
         raw
     )
@@ -1640,29 +1944,33 @@ def process_one_recording(
         )
     )
 
-    # 6) Common average reference.
+    # 6) Common-average reference.
     raw.set_eeg_reference(
         ref_channels="average",
         projection=False,
         verbose="ERROR",
     )
 
-    # 7) FastICA ocular removal.
-    raw, ica_excluded, ica_converged = (
-        run_ica_ocular_removal(
-            raw
-        )
+    # 7) Conservative frontal-proxy ICA.
+    (
+        raw,
+        ica_excluded,
+        ica_converged,
+        ica_proxy_channels,
+    ) = run_ica_ocular_removal(
+        raw
     )
 
-    # 8) Final fixed 26 EEG channels only.
+    # 8) COMMON_64 has already been selected and ordered at MAT import.
     raw.pick(
-        EEG_26
-    )
-    raw.reorder_channels(
-        EEG_26
+        COMMON_64
     )
 
-    # 9) Whole-file EC segmentation into complete 1-s windows.
+    raw.reorder_channels(
+        COMMON_64
+    )
+
+    # 9) Whole-recording EC -> 1-s windows, export uV.
     (
         data,
         starts,
@@ -1714,12 +2022,12 @@ def process_one_recording(
         - int(data.shape[0])
     )
 
-    # 11) Pearson FC only for windows that survive QC.
+    # 11) FC only for windows that survive QC.
     fc = compute_pearson_fc(
         data
     )
 
-    # 12) Save in a PRED+CT-compatible NPZ structure.
+    # 12) Save.
     save_npz(
         output_path=output_path,
         data=data,
@@ -1732,26 +2040,46 @@ def process_one_recording(
         event_block_starts=event_block_starts,
         event_block_ends=event_block_ends,
         subject_id=subject_id,
-        session_id=session_id,
         diagnosis=diagnosis,
-        source_file=bdf_path.name,
+        diagnosis_id=diagnosis_id,
+        source_file=mat_path.name,
+        original_sfreq=original_sfreq,
+        mat_info=mat_info,
         bad_channels=bad_channels,
         interpolation_log=interpolation_log,
         ica_excluded=ica_excluded,
         ica_converged=ica_converged,
-        label_table_path=label_table_path,
+        ica_proxy_channels=ica_proxy_channels,
         window_qc=window_qc,
+    )
+
+    # Output QC summary.
+    max_abs_uv = float(
+        np.max(
+            np.abs(data)
+        )
+    )
+
+    mean_abs_fc = float(
+        np.mean(
+            np.abs(fc)
+        )
+    )
+
+    zero_fc = int(
+        np.sum(
+            np.all(
+                fc == 0.0,
+                axis=(1, 2),
+            )
+        )
     )
 
     result = {
         "subject_id": subject_id,
-        "session_id": session_id,
         "diagnosis": diagnosis,
-        "diagnosis_id": (
-            1 if diagnosis == "MDD"
-            else 0
-        ),
-        "source_file": bdf_path.name,
+        "diagnosis_id": diagnosis_id,
+        "source_file": mat_path.name,
         "output_file": output_path.name,
         "status": "OK",
         "original_sfreq": original_sfreq,
@@ -1767,17 +2095,20 @@ def process_one_recording(
         "samples_per_window": int(
             data.shape[2]
         ),
-        "fc_shape_per_window": (
-            f"{data.shape[1]}x"
-            f"{data.shape[1]}"
+        "data_unit": OUTPUT_EEG_UNIT,
+        "channel_order": "|".join(COMMON_64),
+        "channel_mapping_json": json.dumps(
+            COMMON64_TO_HYDROCEL,
+            ensure_ascii=False,
         ),
+        "max_abs_uV": max_abs_uv,
+        "fc_shape_per_window": "64x64",
         "fc_method": (
-            "Pearson correlation; "
-            "diagonal=0"
+            "Pearson correlation; diagonal=0"
         ),
-        "line_freq": (
-            DEFAULT_LINE_FREQ
-        ),
+        "mean_abs_fc": mean_abs_fc,
+        "all_zero_fc_matrices": zero_fc,
+        "line_freq": DEFAULT_LINE_FREQ,
         "bad_channels": (
             ",".join(
                 bad_channels
@@ -1796,6 +2127,9 @@ def process_one_recording(
             interpolation_log,
             ensure_ascii=False,
         ),
+        "ica_proxy_channels": ",".join(
+            ica_proxy_channels
+        ),
         "ica_excluded": ",".join(
             map(
                 str,
@@ -1807,73 +2141,39 @@ def process_one_recording(
         ),
     }
 
-    del raw, data, fc
+    del raw, data, fc, mat_data
     gc.collect()
 
     return result
 
 
 # =============================================================================
-# 9. DISCOVER LABELLED TDBRAIN REST-EC RECORDINGS
+# 10. DISCOVERY + BATCH
 # =============================================================================
 
 def discover_recordings(
-    root: Path,
-    label_lookup: dict[
-        tuple[str, int],
-        str,
-    ],
+    data_dir: Path,
 ) -> list[Path]:
-    """
-    Process only subjects/sessions present in the MDD/HEALTHY spreadsheet.
-    """
-    recordings: list[Path] = []
-
-    for (
-        subject_id,
-        session_number,
-    ), diagnosis in sorted(
-        label_lookup.items()
-    ):
-        if diagnosis not in {
-            "MDD",
-            "HEALTHY",
-        }:
-            continue
-
-        session_id = (
-            f"ses-{session_number}"
-        )
-
-        bdf_path = (
-            root
-            / subject_id
-            / session_id
-            / "eeg"
-            / (
-                f"{subject_id}_"
-                f"{session_id}_"
-                "task-restEC_eeg.bdf"
+    if PROCESS_ONLY_SINGLE_TEST_FILE:
+        if not SINGLE_TEST_FILE.exists():
+            raise FileNotFoundError(
+                f"Single test file not found: {SINGLE_TEST_FILE}"
             )
-        )
+        return [SINGLE_TEST_FILE]
 
-        if not bdf_path.exists():
-            print(
-                "[WARN] Missing restEC BDF: "
-                f"{bdf_path}"
-            )
-            continue
+    recordings = sorted(
+        data_dir.glob("*.mat")
+    )
 
-        recordings.append(
-            bdf_path
-        )
+    # Keep only official resting EEG subject files whose names encode diagnosis.
+    recordings = [
+        path
+        for path in recordings
+        if path.stem.startswith(("0201", "0203"))
+    ]
 
     return recordings
 
-
-# =============================================================================
-# 10. BATCH PROCESSING WITH TQDM
-# =============================================================================
 
 def main() -> None:
     OUTPUT_DIR.mkdir(
@@ -1881,52 +2181,29 @@ def main() -> None:
         exist_ok=True,
     )
 
-    label_table, label_table_path = (
-        load_label_table(
-            LABEL_TABLE_PATH,
-            DATASET_ROOT,
-        )
-    )
-
-    label_lookup = (
-        build_label_lookup(
-            label_table
-        )
-    )
-
     recordings = discover_recordings(
-        DATASET_ROOT,
-        label_lookup,
-    )
-
-    diagnosis_counts = (
-        label_table[
-            "formal_status"
-        ]
-        .value_counts()
-        .to_dict()
+        DATA_DIR
     )
 
     print(
-        f"Dataset root : {DATASET_ROOT}"
+        f"Dataset dir : {DATA_DIR}"
     )
     print(
-        f"Output dir   : {OUTPUT_DIR}"
+        f"Output dir  : {OUTPUT_DIR}"
     )
     print(
-        f"Label table  : {label_table_path}"
+        f"Input unit  : {MAT_INPUT_UNIT}"
     )
     print(
-        f"Labels       : {diagnosis_counts}"
+        f"Output unit : {OUTPUT_EEG_UNIT}"
     )
     print(
-        f"Recordings   : {len(recordings)}"
+        f"Recordings  : {len(recordings)}"
     )
 
     if not recordings:
         raise RuntimeError(
-            "No labelled TDBRAIN restEC "
-            "recordings were found."
+            "No MODMA resting-state MAT recordings were found."
         )
 
     results = []
@@ -1937,29 +2214,17 @@ def main() -> None:
     progress_bar = tqdm(
         recordings,
         total=len(recordings),
-        desc="TDBRAIN preprocessing",
+        desc="MODMA preprocessing",
         unit="recording",
         dynamic_ncols=True,
         leave=True,
     )
 
-    for bdf_path in progress_bar:
-        subject_id, session_id = (
-            parse_subject_and_session_from_filename(
-                bdf_path
-            )
-        )
-
-        subject_id = (
-            subject_id or "unknown"
-        )
-        session_id = (
-            session_id or "unknown"
-        )
+    for mat_path in progress_bar:
+        subject_id = mat_path.stem
 
         progress_bar.set_postfix(
             subject=subject_id,
-            session=session_id,
             OK=success_count,
             SKIP=skip_count,
             ERR=error_count,
@@ -1967,13 +2232,9 @@ def main() -> None:
         )
 
         try:
-            result = (
-                process_one_recording(
-                    bdf_path=bdf_path,
-                    output_dir=OUTPUT_DIR,
-                    label_lookup=label_lookup,
-                    label_table_path=label_table_path,
-                )
+            result = process_one_recording(
+                mat_path=mat_path,
+                output_dir=OUTPUT_DIR,
             )
 
             results.append(
@@ -1987,9 +2248,7 @@ def main() -> None:
                 skip_count += 1
 
                 tqdm.write(
-                    f"[SKIP] "
-                    f"{result['subject_id']} "
-                    f"{result['session_id']} | "
+                    f"[SKIP] {subject_id} | "
                     f"{result['diagnosis']} | "
                     f"{result.get('n_windows', 0)} windows | "
                     "existing NPZ"
@@ -1999,56 +2258,41 @@ def main() -> None:
                 success_count += 1
 
                 tqdm.write(
-                    f"[OK] "
-                    f"{result['subject_id']} "
-                    f"{result['session_id']} | "
+                    f"[OK] {subject_id} | "
                     f"{result['diagnosis']} | "
                     f"{result['n_windows']} windows | "
                     f"removed={result.get('n_windows_removed_qc', 0)} | "
-                    "EEG=26x250 uV | FC=26x26"
+                    "EEG=64x250 uV | FC=64x64 | "
+                    f"mean|FC|={result['mean_abs_fc']:.4f}"
                 )
 
         except Exception as error:
             error_count += 1
 
             tqdm.write(
-                f"[ERROR] "
-                f"{subject_id} "
-                f"{session_id} | "
-                f"{error}"
+                f"[ERROR] {subject_id} | {error}"
             )
 
-            results.append(
-                {
-                    "subject_id": (
-                        subject_id
-                    ),
-                    "session_id": (
-                        session_id
-                    ),
-                    "source_file": (
-                        bdf_path.name
-                    ),
-                    "status": "ERROR",
-                    "error": repr(error),
-                }
-            )
+            results.append({
+                "subject_id": subject_id,
+                "source_file": mat_path.name,
+                "status": "ERROR",
+                "error": repr(error),
+            })
 
         progress_bar.set_postfix(
             subject=subject_id,
-            session=session_id,
             OK=success_count,
             SKIP=skip_count,
             ERR=error_count,
             refresh=True,
         )
 
-        # Same continuous logging behavior as PRED+CT.
         pd.DataFrame(
             results
         ).to_csv(
             OUTPUT_DIR
-            / "TDBRAIN_preprocessing_summary.csv",
+            / "MODMA_preprocessing_summary.csv",
             index=False,
             encoding="utf-8-sig",
         )
@@ -2077,16 +2321,14 @@ def main() -> None:
 
     if not summary.empty:
         print(
-            summary[
-                "status"
-            ].value_counts(
+            summary["status"].value_counts(
                 dropna=False
             )
         )
 
     print(
         "Summary saved to: "
-        f"{OUTPUT_DIR / 'TDBRAIN_preprocessing_summary.csv'}"
+        f"{OUTPUT_DIR / 'MODMA_preprocessing_summary.csv'}"
     )
 
 

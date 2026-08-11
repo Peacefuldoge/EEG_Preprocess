@@ -1465,7 +1465,7 @@ def save_npz(
             f"FC shape {fc.shape} does not match EEG data shape {data.shape}."
         )
 
-    np.savez(
+    np.savez_compressed(
         output_path,
         data=data,
         fc=fc,

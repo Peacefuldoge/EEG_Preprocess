@@ -1727,7 +1727,7 @@ def save_npz(
         "window_qc": window_qc,
     }
 
-    np.savez_compressed(
+    np.savez(
         output_path,
         data=data,
         fc=fc,
