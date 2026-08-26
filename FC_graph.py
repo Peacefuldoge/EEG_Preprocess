@@ -24,19 +24,19 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
 # "mean"   : 对一个文件内所有窗口的 FC 取平均
 # "window" : 只画某个窗口
-PLOT_MODE = "mean"
-WINDOW_IDX = 0
+PLOT_MODE = "window"
+WINDOW_IDX = 2
 
 # 最强连接数量
-N_LINES_64 = 180
-N_LINES_26 = 100
+N_LINES_64 = 2016
+N_LINES_26 = 676
 
 # 普通 FC 连线宽度
 NORMAL_LINEWIDTH = 1.15
 NORMAL_LINE_ALPHA = 0.90
 
 # 被 mask 的连接：纯黑、加粗
-MASKED_LINEWIDTH = 4.5
+MASKED_LINEWIDTH = 2.5
 
 # 可以指定任意多对。
 # 这里放了 3 对示例，并且这 3 对在你给的 64ch / 26ch 文件中都存在。
@@ -44,6 +44,12 @@ MASKED_LINEWIDTH = 4.5
 #     ("Fp1", "O2"),
 #     ("F3", "P4"),
 #     ("C3", "C4"),
+#     ("F3", "F5"),
+#     ("F7", "P1"),
+#     ("AF4", "F1"),
+#     ("P7", "P5"),
+#     ("P5", "P3"),
+#     ("P3", "O1"),
 # ]
 MASKED_PAIRS = []
 
